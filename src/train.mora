@@ -22,7 +22,7 @@ task evaluate_val_loss(p: MiniLLaMAParams, cfg: ModelConfig, ds: TextDataset, ba
 end
 
 task main()
-  let app = load_config("config/default.json")
+  let app = load_config("config/train_tinystories.json")
   let mcfg = app.model
   let dcfg = app.data
   let tcfg = app.train
@@ -94,7 +94,7 @@ task main()
   assign metrics = metrics.set("project", app.project).set("architecture", mcfg.architecture).set("parameters", n_params).set("total_steps", tcfg.total_steps).set("final_train_loss", last_train_loss).set("best_val_loss", best_val_loss).set("best_val_ppl", math.exp(best_val_loss))
   file.write_text(tcfg.metrics_path, json.stringify(metrics))
 
-  let preview_prompt = if gcfg.prompts.len() > 0 then gcfg.prompts[0] else "The transformer " end
+  let preview_prompt = if gcfg.prompts.len() > 0 then gcfg.prompts[0] else "Once upon a time " end
   let preview_out = generate_text(params, mcfg, tok, ds.eye_rows, causal_mask, rope_cos, rope_sin, rot_j, preview_prompt, 64, gcfg.temperature, gcfg.top_k, gcfg.seed)
   print("=== Post-Training Generation Preview ===")
   print("Prompt:", preview_prompt)
