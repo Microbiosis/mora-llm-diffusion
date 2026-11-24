@@ -1,0 +1,107 @@
+-- Pure-Mora ASCII + Special Token Byte Tokenizer (Vocab Size = 101).
+-- Special tokens: 0=<pad>, 1=<bos>, 2=<eos>, 3=<unk>, 4='\n', 5='\t'
+-- Printable ASCII 32..=126 maps to token IDs 6..=100.
+
+export let PAD_ID: int = 0
+export let BOS_ID: int = 1
+export let EOS_ID: int = 2
+export let UNK_ID: int = 3
+export let NEWLINE_ID: int = 4
+export let TAB_ID: int = 5
+export let ASCII_OFFSET: int = 6
+export let VOCAB_SIZE: int = 101
+
+export task byte_to_token(b: int): int
+  if b == 10 then
+    return NEWLINE_ID
+  end
+  if b == 9 then
+    return TAB_ID
+  end
+  if b >= 32 and b <= 126 then
+    return ASCII_OFFSET + (b - 32)
+  end
+  return UNK_ID
+end
+
+export task token_to_byte(tid: int): int
+  if tid == NEWLINE_ID then
+    return 10
+  end
+  if tid == TAB_ID then
+    return 9
+  end
+  if tid >= ASCII_OFFSET and tid < VOCAB_SIZE then
+    return 32 + (tid - ASCII_OFFSET)
+  end
+  return -1
+end
+
+export struct ByteTokenizer
+  vocab_size: int = 101
+  pad_id: int = 0
+  bos_id: int = 1
+  eos_id: int = 2
+  unk_id: int = 3
+end
+
+impl ByteTokenizer
+  task encode(self, text: string, add_bos: bool = false, add_eos: bool = false): list<int>
+    let out: list<int> = []
+    if add_bos then
+      assign out = out.push(self.bos_id)
+    end
+    if text.len() > 0 then
+      let raw_bytes: list<any> = Tensor::from_utf8(text).to_list()
+      for b_val in raw_bytes
+        let b = int(b_val)
+        -- Skip CR (\r = 13) for cross-platform Windows/Unix line-ending consistency
+        if b != 13 then
+          assign out = out.push(byte_to_token(b))
+        end
+      end
+    end
+    if add_eos then
+      assign out = out.push(self.eos_id)
+    end
+    return out
+  end
+
+  task decode(self, ids: list<int>): string
+    let bytes: list<int> = []
+    for tid in ids
+      let b = token_to_byte(tid)
+      if b >= 0 then
+        assign bytes = bytes.push(b)
+      end
+    end
+    if bytes.len() == 0 then
+      return ""
+    end
+    return Tensor::from_list(bytes, "u8").to_utf8()
+  end
+
+  task decode_token(self, tid: int): string
+    if tid == self.pad_id then
+      return "<pad>"
+    end
+    if tid == self.bos_id then
+      return "<bos>"
+    end
+    if tid == self.eos_id then
+      return "<eos>"
+    end
+    if tid == self.unk_id then
+      return "<unk>"
+    end
+    let b = token_to_byte(tid)
+    if b < 0 then
+      return "<unk>"
+    end
+    return Tensor::from_list([b], "u8").to_utf8()
+  end
+end
+
+export task create_tokenizer(): ByteTokenizer
+  return ByteTokenizer(vocab_size = VOCAB_SIZE, pad_id = PAD_ID, bos_id = BOS_ID, eos_id = EOS_ID, unk_id = UNK_ID)
+end

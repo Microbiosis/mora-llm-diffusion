@@ -1,0 +1,24 @@
+The transformer reads a sequence of tokens and predicts the next token from context.
+In each block, root mean square normalization stabilizes the hidden state before attention.
+Rotary position embeddings encode relative distance directly into query and key vectors.
+Grouped query attention shares key and value heads across multiple query heads to save memory.
+SwiGLU combines a smooth gated activation with linear projections for strong representation power.
+
+In the quiet lab, small neural models train step by step with clean gradients and steady loss.
+First, the tokenizer maps text into discrete integer tokens from a compact byte vocabulary.
+Next, mini-batches of sliding windows feed into the causal self-attention layers.
+A causal mask ensures that every token attends only to itself and earlier positions in the sequence.
+Then, cross-entropy loss measures how closely the predicted probabilities match the target token.
+
+During backpropagation, reverse-mode automatic differentiation traces every tensor operation.
+Gradient norm clipping prevents sudden spikes when multiple layers stack deep residual paths.
+The cosine learning rate schedule warms up gently and decays smoothly toward the minimum rate.
+AdamW updates parameters with momentum, adaptive variance scaling, and decoupled weight decay.
+
+After training, the model saves its weights to a SafeTensors checkpoint on disk.
+SafeTensors stores each tensor with exact dtype metadata and contiguous binary buffers.
+During inference, autoregressive decoding generates one new token at a time from a prompt.
+Temperature scaling and top-k filtering balance coherence and diversity in the generated text.
+The transformer learns grammar, structure, and rhythm from the patterns inside the corpus.
+Attention weights focus on relevant earlier words to complete each phrase with clarity.
+In the quiet lab, every experiment is reproducible, verifiable, and grounded in measured loss.

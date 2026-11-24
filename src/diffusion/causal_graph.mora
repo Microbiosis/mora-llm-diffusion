@@ -1,0 +1,97 @@
+-- CAD-BEBC Attention Structure: Intra-Block Bidirectional + Inter-Block Bidirectional Causal W_blk + Prefix Causal Order.
+
+export task build_block_projection(num_blocks: int, block_size: int): Tensor<f64, _, cpu>
+  let total_tok = num_blocks * block_size
+  let rows: list<list<float>> = []
+  let i = 0
+  while i < total_tok
+    let blk = i / block_size
+    let row: list<float> = []
+    let k = 0
+    while k < num_blocks
+      assign row = row.push(if k == blk then 1.0 else 0.0 end)
+      assign k = k + 1
+    end
+    assign rows = rows.push(row)
+    assign i = i + 1
+  end
+  return Tensor::from_list(rows, "f64")
+end
+
+export task build_off_diag_mask(num_blocks: int): Tensor<f64, _, cpu>
+  let rows: list<list<float>> = []
+  let bi = 0
+  while bi < num_blocks
+    let row: list<float> = []
+    let bj = 0
+    while bj < num_blocks
+      assign row = row.push(if bi == bj then 0.0 else 1.0 end)
+      assign bj = bj + 1
+    end
+    assign rows = rows.push(row)
+    assign bi = bi + 1
+  end
+  return Tensor::from_list(rows, "f64")
+end
+
+export task build_prefix_causal_mask(num_blocks: int, block_size: int, prefix_blocks: int): Tensor<f64, _, cpu>
+  -- Enforces causal block order among prefix blocks (bj > bi within prefix is masked -1e9),
+  -- while keeping intra-block attention bidirectional (0.0) and allowing bidirectional inter-block coupling via W_blk.
+  let total_tok = num_blocks * block_size
+  let rows: list<list<float>> = []
+  let i = 0
+  while i < total_tok
+    let bi = i / block_size
+    let row: list<float> = []
+    let j = 0
+    while j < total_tok
+      let bj = j / block_size
+      let is_prefix_future = (bi < prefix_blocks) and (bj < prefix_blocks) and (bj > bi)
+      assign row = row.push(if is_prefix_future then -1000000000.0 else 0.0 end)
+      assign j = j + 1
+    end
+    assign rows = rows.push(row)
+    assign i = i + 1
+  end
+  return Tensor::from_list(rows, "f64")
+end
+
+export task init_w_blk(off_diag: Tensor<f64, _, cpu>, init_iso: float): Tensor<f64, _, cpu>
+  return off_diag * (-init_iso)
+end
+
+export task struct_bias_from_wblk(w_blk: Tensor<f64, _, cpu>, p_blk: Tensor<f64, _, cpu>, off_diag: Tensor<f64, _, cpu>, prefix_mask: Tensor<f64, _, cpu>): Tensor<f64, _, cpu>
+  -- Fully differentiable tensor expansion inside autograd tape combining W_blk + prefix causal order
+  let w_masked = w_blk * off_diag
+  return ((p_blk @ w_masked) @ p_blk.transpose(0, 1)) + prefix_mask
+end
+
+export task mean_interblock_coupling(w_blk: Tensor<f64, _, cpu>, init_iso: float): float
+  let shp = w_blk.shape()
+  let k = shp[0]
+  if k <= 1 then
+    return 0.0
+  end
+  let rows: list<any> = w_blk.to_list()
+  let total = 0.0
+  let count = 0
+  let i = 0
+  while i < k
+    let row: list<any> = rows[i]
+    let j = 0
+    while j < k
+      if i != j then
+        let wv = float(row[j])
+        let eff = math.exp(wv)
+        if eff > 1.0 then
+          assign eff = 1.0
+        end
+        assign total = total + eff
+        assign count = count + 1
+      end
+      assign j = j + 1
+    end
+    assign i = i + 1
+  end
+  return total / float(count)
+end

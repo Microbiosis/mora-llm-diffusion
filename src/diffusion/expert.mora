@@ -1,0 +1,140 @@
+-- Unified External Frozen Model Adapter: Mini-LLaMA ("llama"), HTTP Service ("http"), and SafeTensors ("safetensors").
+
+import "std/net/http"
+import "std/nn/safetensors"
+import "src/config.mora"
+import "src/data.mora"
+import "src/model.mora"
+import "src/checkpoint.mora"
+import "src/diffusion/config.mora"
+
+export struct ExternalFastExpert
+  mode: string = "llama"
+  http_addr: string = "127.0.0.1:18080"
+  http_path: string = "/v1/predict"
+  model_name: string = "mini-llama-frozen-v1"
+  timeout_ms: int = 3000
+  has_weights: bool = false
+  in_proj: Tensor<f64, _, cpu>
+  an1: Tensor<f64, _, cpu>
+  wg1: Tensor<f64, _, cpu>
+  wu1: Tensor<f64, _, cpu>
+  wd1: Tensor<f64, _, cpu>
+  an2: Tensor<f64, _, cpu>
+  wg2: Tensor<f64, _, cpu>
+  wu2: Tensor<f64, _, cpu>
+  wd2: Tensor<f64, _, cpu>
+  out_proj: Tensor<f64, _, cpu>
+  has_llama: bool = false
+  llama_cfg: ModelConfig
+  llama_params: MiniLLaMAParams
+  llama_mask: Tensor<f64, _, cpu>
+  llama_cos: Tensor<f64, _, cpu>
+  llama_sin: Tensor<f64, _, cpu>
+  llama_rot_j: Tensor<f64, [2, 2], cpu>
+  rms_eps: float = 0.00001
+end
+
+export task expert_forward_raw(p_in: Tensor<f64, _, cpu>, an1: Tensor<f64, _, cpu>, wg1: Tensor<f64, _, cpu>, wu1: Tensor<f64, _, cpu>, wd1: Tensor<f64, _, cpu>, an2: Tensor<f64, _, cpu>, wg2: Tensor<f64, _, cpu>, wu2: Tensor<f64, _, cpu>, wd2: Tensor<f64, _, cpu>, p_out: Tensor<f64, _, cpu>, x_obs: Tensor<f64, _, cpu>, rms_eps: float): Tensor<f64, _, cpu>
+  let h = x_obs @ p_in
+  let n1 = h.rms_norm(rms_eps) * an1
+  assign h = h + (((n1 @ wg1).silu() * (n1 @ wu1)) @ wd1)
+  let n2 = h.rms_norm(rms_eps) * an2
+  assign h = h + (((n2 @ wg2).silu() * (n2 @ wu2)) @ wd2)
+  return x_obs + (h @ p_out)
+end
+
+task req_exp_tensor(ts: dict<string, any>, name: string): Tensor<f64, _, cpu>
+  let v = ts.get(name)
+  assert(type_of(v) == "tensor", "missing external expert tensor: " + name)
+  return v.contiguous()
+end
+
+export task count_expert_parameters(exp: ExternalFastExpert): int
+  if exp.has_llama then
+    return count_parameters(exp.llama_params)
+  end
+  if !exp.has_weights then
+    return 0
+  end
+  return exp.in_proj.numel() + exp.an1.numel() + exp.wg1.numel() + exp.wu1.numel() + exp.wd1.numel() + exp.an2.numel() + exp.wg2.numel() + exp.wu2.numel() + exp.wd2.numel() + exp.out_proj.numel()
+end
+
+export task save_external_expert(path: string, exp: ExternalFastExpert, d_model: int, hidden: int): int
+  let dir = file.dirname(path)
+  if dir != "" and !file.exists(dir) then
+    file.mkdir_all(dir)
+  end
+  let ts: dict<string, any> = {}
+  assign ts = ts.set("in_proj.weight", exp.in_proj).set("blk.0.norm.weight", exp.an1).set("blk.0.w_gate.weight", exp.wg1).set("blk.0.w_up.weight", exp.wu1).set("blk.0.w_down.weight", exp.wd1).set("blk.1.norm.weight", exp.an2).set("blk.1.w_gate.weight", exp.wg2).set("blk.1.w_up.weight", exp.wu2).set("blk.1.w_down.weight", exp.wd2).set("out_proj.weight", exp.out_proj)
+  let meta: dict<string, string> = {"architecture": "external-frozen-swiglu-specialist", "d_model": str(d_model), "hidden": str(hidden)}
+  let res = safetensors_save(path, ts, meta)
+  return match res with
+      SafetensorsResult::Ok(n) -> n
+      SafetensorsResult::Err(_) -> 0
+    end
+  end
+
+  export task load_external_expert(cfg: ExternalExpertConfig, rms_eps: float = 0.00001, device: string = "cpu"): ExternalFastExpert
+    let z = Tensor::zeros([1], "f64", "cpu")
+    let dummy_mc = ModelConfig()
+    let dummy_lp = MiniLLaMAParams(tok_emb = z, wq = z, wk = z, wv = z, wo = z, w_gate = z, w_up = z, w_down = z, attn_norm = z, ffn_norm = z, final_norm = z, lm_head = z)
+    let dummy_j = build_rope_rot_matrix()
+
+    if cfg.mode == "http" then
+      return ExternalFastExpert(mode = "http", http_addr = cfg.http_addr, http_path = cfg.http_path, model_name = cfg.model_name, timeout_ms = cfg.timeout_ms, has_weights = false, in_proj = z, an1 = z, wg1 = z, wu1 = z, wd1 = z, an2 = z, wg2 = z, wu2 = z, wd2 = z, out_proj = z, has_llama = false, llama_cfg = dummy_mc, llama_params = dummy_lp, llama_mask = z, llama_cos = z, llama_sin = z, llama_rot_j = dummy_j, rms_eps = rms_eps)
+    end
+
+    if cfg.mode == "llama" then
+      let app = load_config("config/default.json")
+      let mc = app.model
+      let has_ckpt = file.exists(cfg.llama_checkpoint_path)
+      let lp = if has_ckpt then
+        let ckpt = load_checkpoint(cfg.llama_checkpoint_path, mc.n_layers, device)
+        ckpt.params
+      else
+        -- Industrial fallback: random init when large checkpoint is not present
+        init_model_params(mc, 20261123)
+      end
+      let mask = build_causal_mask(mc.seq_len)
+      let rope = build_rope_tables(mc.seq_len, mc.head_dim, mc.rope_theta)
+      return ExternalFastExpert(mode = "llama", http_addr = cfg.http_addr, http_path = cfg.http_path, model_name = cfg.model_name, timeout_ms = cfg.timeout_ms, has_weights = false, in_proj = z, an1 = z, wg1 = z, wu1 = z, wd1 = z, an2 = z, wg2 = z, wu2 = z, wd2 = z, out_proj = z, has_llama = true, llama_cfg = mc, llama_params = lp, llama_mask = mask, llama_cos = rope[0], llama_sin = rope[1], llama_rot_j = dummy_j, rms_eps = mc.rms_eps)
+    end
+
+    assert(file.exists(cfg.checkpoint_path), "external expert SafeTensors not found: " + cfg.checkpoint_path)
+    let res = safetensors_load(cfg.checkpoint_path, device)
+    let sf: SafetensorsFile = match res with
+        SafetensorsResult::Ok(f) -> f
+        SafetensorsResult::Err(_) -> SafetensorsFile(metadata = {}, headers = {}, tensors = {})
+      end
+      assert(sf.tensors.len() > 0, "failed to decode external expert SafeTensors: " + cfg.checkpoint_path)
+      let ts = sf.tensors
+      return ExternalFastExpert(mode = "safetensors", http_addr = cfg.http_addr, http_path = cfg.http_path, model_name = cfg.model_name, timeout_ms = cfg.timeout_ms, has_weights = true, in_proj = req_exp_tensor(ts, "in_proj.weight"), an1 = req_exp_tensor(ts, "blk.0.norm.weight"), wg1 = req_exp_tensor(ts, "blk.0.w_gate.weight"), wu1 = req_exp_tensor(ts, "blk.0.w_up.weight"), wd1 = req_exp_tensor(ts, "blk.0.w_down.weight"), an2 = req_exp_tensor(ts, "blk.1.norm.weight"), wg2 = req_exp_tensor(ts, "blk.1.w_gate.weight"), wu2 = req_exp_tensor(ts, "blk.1.w_up.weight"), wd2 = req_exp_tensor(ts, "blk.1.w_down.weight"), out_proj = req_exp_tensor(ts, "out_proj.weight"), has_llama = false, llama_cfg = dummy_mc, llama_params = dummy_lp, llama_mask = z, llama_cos = z, llama_sin = z, llama_rot_j = dummy_j, rms_eps = rms_eps)
+    end
+
+    export task expert_predict(exp: ExternalFastExpert, x_obs: Tensor<f64, _, cpu>): Tensor<f64, _, cpu>
+      if exp.mode == "http" then
+        let req_obj: dict<string, any> = {}
+        assign req_obj = req_obj.set("model", exp.model_name).set("shape", x_obs.shape()).set("input", x_obs.to_list())
+        let resp = post(exp.http_addr, exp.http_path, json.stringify(req_obj), "application/json", exp.timeout_ms)
+        assert_eq(resp.status, 200, "external HTTP model returned non-200 status")
+        let parsed: dict<string, any> = json.parse(resp.body)
+        let pred_raw = parsed.get("prediction")
+        assert(type_of(pred_raw) == "list", "external HTTP response missing 'prediction' tensor list")
+        let pred_list: list<any> = json.parse(json.stringify(pred_raw))
+        return Tensor::from_list(pred_list, "f64")
+      end
+
+      if exp.mode == "llama" then
+        let lp = exp.llama_params
+        let lc = exp.llama_cfg
+        return no_grad
+        let h_out = forward_hidden_from_latent(lp.wq, lp.wk, lp.wv, lp.wo, lp.w_gate, lp.w_up, lp.w_down, lp.attn_norm, lp.ffn_norm, lp.final_norm, x_obs, exp.llama_mask, exp.llama_cos, exp.llama_sin, exp.llama_rot_j, lc.n_layers, lc.n_q_heads, lc.n_kv_heads, lc.head_dim, lc.rms_eps)
+        x_obs + h_out * 0.25
+      end
+    end
+
+    return no_grad
+    expert_forward_raw(exp.in_proj, exp.an1, exp.wg1, exp.wu1, exp.wd1, exp.an2, exp.wg2, exp.wu2, exp.wd2, exp.out_proj, x_obs, exp.rms_eps)
+  end
+end

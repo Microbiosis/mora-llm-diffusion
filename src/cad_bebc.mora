@@ -1,0 +1,102 @@
+-- Unified Single-System CAD-BEBC Entrypoint:
+-- Continuous Autoregressive Diffusion + Error-Gated Dead-Zone Weight Emergence (m_ok / m_fail + b_rest).
+
+import "std/net/http"
+import "std/nn/safetensors"
+import "src/config.mora"
+import "src/tokenizer.mora"
+import "src/data.mora"
+import "src/model.mora"
+import "src/checkpoint.mora"
+import "src/sampler.mora"
+import "src/latent_codec.mora"
+import "src/diffusion/config.mora"
+import "src/diffusion/causal_graph.mora"
+import "src/diffusion/backbone.mora"
+import "src/diffusion/shortcut.mora"
+import "src/diffusion/expert.mora"
+import "src/diffusion/pipeline.mora"
+
+task main()
+  let cfg = load_diffusion_config("config/diffusion.json")
+  let mc = cfg.model
+  let sc = cfg.schedule
+
+  print("=== CAD-BEBC Unified System (Error-Gated Slow Weight Emergence) ===")
+  print("arch:", cfg.architecture, "| layers:", mc.n_layers, "| blocks:", mc.num_blocks, "x", mc.block_size, "(prefix:", mc.prefix_blocks, ") | D:", mc.d_model, "| external_mode:", cfg.external_expert.mode)
+
+  let codec = load_latent_codec("config/default.json", cfg.external_expert.llama_checkpoint_path)
+  let sys = init_diffusion_system(cfg)
+  print("backbone_params:", count_backbone_parameters(sys.backbone), "| frozen_external_expert:", count_expert_parameters(sys.expert), "| vocab:", codec.tok.vocab_size)
+
+  let seq_expected = mc.num_blocks * mc.block_size
+  let text_ok = codec.d_model == mc.d_model and codec.seq_len == seq_expected
+
+  -- Phase 1: Cold Start Unified Inference
+  let s_pair0 = sample_structured_batch(2, mc.num_blocks, mc.block_size, mc.d_model, "simple", sc.seed + 100)
+  let c_pair0 = sample_structured_batch(2, mc.num_blocks, mc.block_size, mc.d_model, "complex", sc.seed + 200)
+  let inf_s0 = infer_system(sys, s_pair0[0], false)
+  let inf_c0 = infer_system(sys, c_pair0[0], false)
+  print("--- Phase 1: Cold Start (Frozen Mini-LLaMA Fast Path) ---")
+  print("simple  -> mode:", inf_s0.path_mode, "| nfe:", inf_s0.backbone_nfe, "| pi_int:", inf_s0.pi_int)
+  print("complex -> mode:", inf_c0.path_mode, "| nfe:", inf_c0.backbone_nfe, "| pi_int:", inf_c0.pi_int, "| mean_b_g:", mean_gate_bias(sys), "| coupling:", mean_interblock_coupling(sys.w_blk, mc.init_iso))
+
+  -- Phase 2: Error-Gated Weight Emergence (m_ok / m_fail driving U, V, w_g, b_g, W_blk, comp)
+  print("--- Phase 2: Error-Gated Weight Emergence (", sc.consolidation_steps, "steps ) ---")
+  let st = 1
+  while st <= sc.consolidation_steps
+    let reg = if st % 4 == 0 then "simple" else "complex" end
+    let pair = sample_structured_batch(2, mc.num_blocks, mc.block_size, mc.d_model, reg, sc.seed + 1000 + st)
+    let em = emerge_step(sys, pair[0], pair[1], sc.seed + 5000 + st)
+    assign sys = em.system
+    if st == 1 or st == 60 or st == 130 or st == 200 or st == sc.consolidation_steps then
+      let chk = infer_system(sys, c_pair0[0], false)
+      print("  [step", st, "] e_base:", em.e_base, "| m_ok:", em.m_ok_mean, "| mode:", chk.path_mode, "| nfe:", chk.backbone_nfe, "| skips:", chk.shortcuts_used, "| mean_b_g:", mean_gate_bias(sys), "| V_rms:", mean_shortcut_v_rms(sys), "| coupling:", mean_interblock_coupling(sys.w_blk, mc.init_iso))
+    end
+    assign st = st + 1
+  end
+
+  -- Phase 3: Mature Evaluation (True Early-Skip NFE Reduction + Text Latent Decoding)
+  let nfe_sum = 0
+  let skip_sum = 0
+  let mse_short_sum = 0.0
+  let mse_full_sum = 0.0
+  let m_step = 1
+  while m_step <= sc.mature_eval_steps
+    let pair = sample_structured_batch(2, mc.num_blocks, mc.block_size, mc.d_model, "complex", sc.seed + 15000 + m_step)
+    let inf_short = infer_system(sys, pair[0], false)
+    let inf_full = infer_system(sys, pair[0], true)
+    assign nfe_sum = nfe_sum + inf_short.backbone_nfe
+    assign skip_sum = skip_sum + inf_short.shortcuts_used
+    assign mse_short_sum = mse_short_sum + float(((inf_short.output - pair[1]) * (inf_short.output - pair[1])).mean())
+    assign mse_full_sum = mse_full_sum + float(((inf_full.output - pair[1]) * (inf_full.output - pair[1])).mean())
+    assign m_step = m_step + 1
+  end
+  print("--- Phase 3: Mature Evaluation (", sc.mature_eval_steps, "samples ) ---")
+  print("avg_NFE:", float(nfe_sum) / float(sc.mature_eval_steps), "| avg_skips:", float(skip_sum) / float(sc.mature_eval_steps), "| short_MSE:", mse_short_sum / float(sc.mature_eval_steps), "| full_MSE:", mse_full_sum / float(sc.mature_eval_steps))
+
+  if text_ok then
+    let prompts: list<string> = ["The transformer ", "Attention weights "]
+    for pr in prompts
+      let gen = cad_bebc_generate_text(sys, codec, pr, 8, 0.4, 8, sc.seed + 77)
+      print("  [unified text] prompt:", pr, "| mode:", gen.path_mode, "| nfe:", gen.backbone_nfe, "| skips:", gen.shortcuts_used, "| decoded:", gen.text)
+    end
+  else
+    print("  [unified text] skipped: codec dims (D=", codec.d_model, ", seq=", codec.seq_len, ") do not match backbone (D=", mc.d_model, ", seq=", seq_expected, ")")
+  end
+
+  -- Phase 4: OOD High-Error Fallback (m_fail pulls b_g back toward b_rest, returning control to full backbone)
+  print("--- Phase 4: OOD High-Error Fallback (", sc.ood_adapt_steps, "steps ) ---")
+  let ood_st = 1
+  while ood_st <= sc.ood_adapt_steps
+    let ood_pair = sample_structured_batch(2, mc.num_blocks, mc.block_size, mc.d_model, "ood", sc.seed + 25000 + ood_st)
+    let em_ood = emerge_step(sys, ood_pair[0], ood_pair[1], sc.seed + 30000 + ood_st)
+    assign sys = em_ood.system
+    if ood_st == 15 or ood_st == 30 or ood_st == sc.ood_adapt_steps then
+      let post_chk = infer_system(sys, c_pair0[0], false)
+      print("  [ood step", ood_st, "] e_base:", em_ood.e_base, "| m_fail:", em_ood.m_fail, "| mean_b_g:", mean_gate_bias(sys), "| V_rms:", mean_shortcut_v_rms(sys), "| post_NFE:", post_chk.backbone_nfe, "| skips:", post_chk.shortcuts_used)
+    end
+    assign ood_st = ood_st + 1
+  end
+  print("=== CAD-BEBC Unified System Complete ===")
+end

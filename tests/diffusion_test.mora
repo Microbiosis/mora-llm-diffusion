@@ -1,0 +1,151 @@
+-- Unit, Live-HTTP, Dead-Zone Plasticity, Text-Codec & OOD-Fallback Tests for CAD-BEBC.
+
+import "std/net/http"
+import "std/nn/safetensors"
+import "src/config.mora"
+import "src/tokenizer.mora"
+import "src/data.mora"
+import "src/model.mora"
+import "src/checkpoint.mora"
+import "src/sampler.mora"
+import "src/latent_codec.mora"
+import "src/diffusion/config.mora"
+import "src/diffusion/causal_graph.mora"
+import "src/diffusion/backbone.mora"
+import "src/diffusion/shortcut.mora"
+import "src/diffusion/expert.mora"
+import "src/diffusion/external_service.mora"
+import "src/diffusion/pipeline.mora"
+
+export task test_deadzone_gates_and_shadow_gradients()
+  let base = load_diffusion_config("config/diffusion.json")
+  let pc = base.plasticity
+  let mid = 0.5 * (pc.eps_low + pc.eps_high)
+  let m_low_mid = deadzone_low_gate(mid, pc)
+  let m_fail_mid = deadzone_fail_gate(mid, pc)
+  assert(m_low_mid < 0.02 and m_fail_mid < 0.02, "dead-zone midpoint must silence both growth and decay")
+  assert(pc.lambda_b >= 5.0 * pc.eta_b, "homeostatic bias pullback must be 5x-10x faster than growth")
+
+  let sc_cfg = ScheduleConfig(pretrain_steps = 10, pretrain_lr = 0.03, cold_start_steps = 1, consolidation_steps = 1, mature_eval_steps = 1, ood_adapt_steps = 1, seed = 42)
+  let cfg = DiffusionAppConfig(architecture = base.architecture, external_expert = base.external_expert, model = base.model, plasticity = pc, schedule = sc_cfg)
+  let sys = init_diffusion_system(cfg)
+
+  let mc = cfg.model
+  let pair = sample_structured_batch(2, mc.num_blocks, mc.block_size, mc.d_model, "complex", 77)
+  let em1 = emerge_step(sys, pair[0], pair[1], 100)
+  assert(mean_shortcut_v_rms(em1.system) > 0.0, "V must grow from zero on step 1 without gradient deadlock")
+end
+
+export task test_cold_start_no_premature_skip_and_fast_path()
+  let base = load_diffusion_config("config/diffusion.json")
+  let sc_cfg = ScheduleConfig(pretrain_steps = 10, pretrain_lr = 0.03, cold_start_steps = 1, consolidation_steps = 1, mature_eval_steps = 1, ood_adapt_steps = 1, seed = 99)
+  let cfg = DiffusionAppConfig(architecture = base.architecture, external_expert = base.external_expert, model = base.model, plasticity = base.plasticity, schedule = sc_cfg)
+  let sys = init_diffusion_system(cfg)
+
+  let mc = cfg.model
+  let pair = sample_structured_batch(2, mc.num_blocks, mc.block_size, mc.d_model, "simple", 123)
+  let inf_fast = infer_system(sys, pair[0], false)
+  assert_eq(inf_fast.path_mode, "external_fast")
+  assert_eq(inf_fast.backbone_nfe, 0)
+  assert_eq(inf_fast.shortcuts_used, 0)
+
+  let inf_full = infer_system(sys, pair[0], true)
+  assert_eq(inf_full.backbone_nfe, 8)
+  assert_eq(inf_full.shortcuts_used, 0)
+end
+
+export task test_cad_bebc_attention_hierarchy()
+  let p_blk = build_block_projection(4, 2)
+  let off_diag = build_off_diag_mask(4)
+  let prefix_mask = build_prefix_causal_mask(4, 2, 2)
+  let w_blk = init_w_blk(off_diag, 4.0)
+  let b0 = struct_bias_from_wblk(w_blk, p_blk, off_diag, prefix_mask)
+
+  assert(math.abs(float(b0[0][1])) < 0.000000000001, "intra-block attention bias must be 0.0")
+  assert(float(b0[0][2]) < -100000000.0, "prefix causal future block must be masked")
+  assert(math.abs(float(b0[2][0]) + 4.0) < 0.000000000001, "prefix backward attention must follow W_blk")
+  assert(math.abs(float(b0[4][6]) + 4.0) < 0.000000000001)
+  assert(math.abs(float(b0[6][4]) + 4.0) < 0.000000000001)
+end
+
+export task test_live_http_external_expert_roundtrip()
+  let base = load_diffusion_config("config/diffusion.json")
+  let exp_local = load_external_expert(base.external_expert, base.model.rms_eps, "cpu")
+  let router_srv = make_expert_router(exp_local)
+
+  let listener = tcp_listen("127.0.0.1:0")
+  let addr = listener.local_addr()
+  let srv = spawn router_srv.serve_listener(listener, 2)
+
+  let health_resp = get(addr, "/health")
+  assert_eq(health_resp.status, 200)
+
+  let http_cfg = ExternalExpertConfig(mode = "http", http_addr = addr, http_path = "/v1/predict", model_name = base.external_expert.model_name, timeout_ms = 5000, checkpoint_path = base.external_expert.checkpoint_path, llama_checkpoint_path = base.external_expert.llama_checkpoint_path)
+  let exp_http = load_external_expert(http_cfg, base.model.rms_eps, "cpu")
+
+  let mc = base.model
+  let pair = sample_structured_batch(2, mc.num_blocks, mc.block_size, mc.d_model, "simple", 555)
+  let y_http = expert_predict(exp_http, pair[0])
+  let y_ref = expert_predict(exp_local, pair[0])
+
+  let served = srv.join()
+  listener.close()
+  assert_eq(served, 2)
+  assert((y_http - y_ref).abs().max() < 0.000000001, "HTTP external model prediction must match reference")
+end
+
+export task test_unified_cad_bebc_text_pipeline()
+  let base = load_diffusion_config("config/diffusion.json")
+  let sc_cfg = ScheduleConfig(pretrain_steps = 10, pretrain_lr = 0.03, cold_start_steps = 1, consolidation_steps = 1, mature_eval_steps = 1, ood_adapt_steps = 1, seed = 2026)
+  let cfg = DiffusionAppConfig(architecture = base.architecture, external_expert = base.external_expert, model = base.model, plasticity = base.plasticity, schedule = sc_cfg)
+
+  let codec = load_latent_codec("config/default.json", cfg.external_expert.llama_checkpoint_path)
+  let sys = init_diffusion_system(cfg)
+  assert(count_expert_parameters(sys.expert) == 25056, "frozen Mini-LLaMA external expert must load all 25,056 params")
+
+  let gen = cad_bebc_generate_text(sys, codec, "The transformer ", 8, 0.0, 8, 42)
+  assert(gen.text.len() > 0, "unified CAD-BEBC text pipeline must produce decoded text")
+end
+
+export task test_error_gated_emergence_skip_and_ood_fallback()
+  let base = load_diffusion_config("config/diffusion.json")
+  let fast_pc = PlasticityConfig(eps_low = 0.12, eps_high = 0.22, temp_e = 0.012, eps_shortcut = 0.16, temp_s = 0.015, eta_lr = 0.6, lambda_decay = 0.2, eta_g = 0.02, lambda_g = 0.1, eta_b = 0.35, lambda_b = 2.0, eta_conn = 0.5, lambda_conn = 2.5, eta_comp = 3.5, lambda_ext_bias = 0.001)
+  let fast_sc = ScheduleConfig(pretrain_steps = 100, pretrain_lr = 0.03, cold_start_steps = 2, consolidation_steps = 40, mature_eval_steps = 4, ood_adapt_steps = 15, seed = 20261123)
+  let cfg = DiffusionAppConfig(architecture = base.architecture, external_expert = base.external_expert, model = base.model, plasticity = fast_pc, schedule = fast_sc)
+
+  let sys = init_diffusion_system(cfg)
+  let mc = cfg.model
+  let init_coupling = mean_interblock_coupling(sys.w_blk, mc.init_iso)
+  let c_probe = sample_structured_batch(2, mc.num_blocks, mc.block_size, mc.d_model, "complex", 777)
+
+  let st = 1
+  while st <= 40
+    let pair = sample_structured_batch(2, mc.num_blocks, mc.block_size, mc.d_model, "complex", 3000 + st)
+    let em = emerge_step(sys, pair[0], pair[1], 4000 + st)
+    assign sys = em.system
+    assign st = st + 1
+  end
+
+  assert(mean_shortcut_v_rms(sys) > 0.0005, "V must grow under low-error m_ok gating")
+  assert(mean_interblock_coupling(sys.w_blk, mc.init_iso) > init_coupling, "W_blk cross-block coupling must grow via m_low-gated backprop")
+
+  let inf = infer_system(sys, c_probe[0], false)
+  assert(inf.shortcuts_used >= 1, "matured b_g must trigger early-skip execution")
+  assert(inf.backbone_nfe < 8, "shortened inference must strictly reduce backbone NFE")
+
+  let b_before_ood = mean_gate_bias(sys)
+  let v_before_ood = mean_shortcut_v_rms(sys)
+  let j = 1
+  while j <= 15
+    let ood_p = sample_structured_batch(2, mc.num_blocks, mc.block_size, mc.d_model, "ood", 6000 + j)
+    let em_ood = emerge_step(sys, ood_p[0], ood_p[1], 7000 + j)
+    assign sys = em_ood.system
+    assign j = j + 1
+  end
+
+  assert(mean_gate_bias(sys) < b_before_ood - 2.0, "m_fail must pull b_g back toward b_rest under OOD")
+  assert(mean_shortcut_v_rms(sys) < v_before_ood * 0.5, "m_fail must decay shortcut weights V under OOD")
+  let inf_post = infer_system(sys, c_probe[0], true)
+  assert_eq(inf_post.shortcuts_used, 0)
+  assert_eq(inf_post.backbone_nfe, 8)
+end

@@ -1,0 +1,122 @@
+-- Configuration loader & strongly-typed hyperparameter structs for Mini-LLaMA.
+
+export struct ModelConfig
+  architecture: string = "mini-llama-rope-gqa-swiglu"
+  vocab_size: int = 101
+  seq_len: int = 16
+  n_layers: int = 2
+  d_model: int = 32
+  n_q_heads: int = 4
+  n_kv_heads: int = 2
+  head_dim: int = 8
+  ffn_hidden: int = 64
+  rms_eps: float = 0.00001
+  rope_theta: float = 10000.0
+  init_scale: float = 0.12
+end
+
+export struct DataConfig
+  corpus_path: string = "data/corpus.txt"
+  val_ratio: float = 0.15
+  batch_size: int = 4
+  seed: int = 20261123
+end
+
+export struct TrainConfig
+  total_steps: int = 160
+  warmup_steps: int = 16
+  max_lr: float = 0.02
+  min_lr: float = 0.002
+  beta1: float = 0.9
+  beta2: float = 0.999
+  eps: float = 0.00000001
+  weight_decay: float = 0.01
+  max_grad_norm: float = 1.0
+  eval_interval: int = 20
+  eval_batches: int = 6
+  log_interval: int = 10
+  checkpoint_dir: string = "checkpoints"
+  best_checkpoint: string = "checkpoints/best.safetensors"
+  latest_checkpoint: string = "checkpoints/latest.safetensors"
+  metrics_path: string = "checkpoints/metrics.json"
+end
+
+export struct GenerateConfig
+  checkpoint_path: string = "checkpoints/best.safetensors"
+  max_new_tokens: int = 96
+  temperature: float = 0.5
+  top_k: int = 8
+  seed: int = 42
+  prompts: list<string>
+end
+
+export struct AppConfig
+  project: string = "mora-mini-llama"
+  version: string = "1.0.0"
+  model: ModelConfig
+  data: DataConfig
+  train: TrainConfig
+  generate: GenerateConfig
+end
+
+task cfg_get_dict(d: dict<string, any>, key: string): dict<string, any>
+  let v = d.get(key)
+  if type_of(v) != "dict" then
+    return {}
+  end
+  let parsed: dict<string, any> = json.parse(json.stringify(v))
+  return parsed
+end
+
+task cfg_get_str(d: dict<string, any>, key: string, fallback: string): string
+  let v = d.get(key)
+  if type_of(v) != "string" then
+    return fallback
+  end
+  return str(v)
+end
+
+task cfg_get_int(d: dict<string, any>, key: string, fallback: int): int
+  let v = d.get(key)
+  if type_of(v) == "int" or type_of(v) == "float" then
+    return int(str(v))
+  end
+  return fallback
+end
+
+task cfg_get_float(d: dict<string, any>, key: string, fallback: float): float
+  let v = d.get(key)
+  if type_of(v) == "float" or type_of(v) == "int" then
+    return float(str(v))
+  end
+  return fallback
+end
+
+task cfg_get_str_list(d: dict<string, any>, key: string): list<string>
+  let v = d.get(key)
+  if type_of(v) != "list" then
+    return []
+  end
+  let items: list<any> = json.parse(json.stringify(v))
+  let out: list<string> = []
+  for item in items
+    assign out = out.push(str(item))
+  end
+  return out
+end
+
+export task load_config(path: string = "config/default.json"): AppConfig
+  let raw_text = file.read_text(path)
+  let root: dict<string, any> = json.parse(raw_text)
+  let m_raw = cfg_get_dict(root, "model")
+  let d_raw = cfg_get_dict(root, "data")
+  let t_raw = cfg_get_dict(root, "train")
+  let g_raw = cfg_get_dict(root, "generate")
+
+  let m_cfg = ModelConfig(architecture = cfg_get_str(m_raw, "architecture", "mini-llama-rope-gqa-swiglu"), vocab_size = cfg_get_int(m_raw, "vocab_size", 101), seq_len = cfg_get_int(m_raw, "seq_len", 16), n_layers = cfg_get_int(m_raw, "n_layers", 2), d_model = cfg_get_int(m_raw, "d_model", 32), n_q_heads = cfg_get_int(m_raw, "n_q_heads", 4), n_kv_heads = cfg_get_int(m_raw, "n_kv_heads", 2), head_dim = cfg_get_int(m_raw, "head_dim", 8), ffn_hidden = cfg_get_int(m_raw, "ffn_hidden", 64), rms_eps = cfg_get_float(m_raw, "rms_eps", 0.00001), rope_theta = cfg_get_float(m_raw, "rope_theta", 10000.0), init_scale = cfg_get_float(m_raw, "init_scale", 0.12))
+  let d_cfg = DataConfig(corpus_path = cfg_get_str(d_raw, "corpus_path", "data/corpus.txt"), val_ratio = cfg_get_float(d_raw, "val_ratio", 0.15), batch_size = cfg_get_int(d_raw, "batch_size", 4), seed = cfg_get_int(d_raw, "seed", 20261123))
+  let t_cfg = TrainConfig(total_steps = cfg_get_int(t_raw, "total_steps", 160), warmup_steps = cfg_get_int(t_raw, "warmup_steps", 16), max_lr = cfg_get_float(t_raw, "max_lr", 0.02), min_lr = cfg_get_float(t_raw, "min_lr", 0.002), beta1 = cfg_get_float(t_raw, "beta1", 0.9), beta2 = cfg_get_float(t_raw, "beta2", 0.999), eps = cfg_get_float(t_raw, "eps", 0.00000001), weight_decay = cfg_get_float(t_raw, "weight_decay", 0.01), max_grad_norm = cfg_get_float(t_raw, "max_grad_norm", 1.0), eval_interval = cfg_get_int(t_raw, "eval_interval", 20), eval_batches = cfg_get_int(t_raw, "eval_batches", 6), log_interval = cfg_get_int(t_raw, "log_interval", 10), checkpoint_dir = cfg_get_str(t_raw, "checkpoint_dir", "checkpoints"), best_checkpoint = cfg_get_str(t_raw, "best_checkpoint", "checkpoints/best.safetensors"), latest_checkpoint = cfg_get_str(t_raw, "latest_checkpoint", "checkpoints/latest.safetensors"), metrics_path = cfg_get_str(t_raw, "metrics_path", "checkpoints/metrics.json"))
+  let g_cfg = GenerateConfig(checkpoint_path = cfg_get_str(g_raw, "checkpoint_path", "checkpoints/best.safetensors"), max_new_tokens = cfg_get_int(g_raw, "max_new_tokens", 96), temperature = cfg_get_float(g_raw, "temperature", 0.5), top_k = cfg_get_int(g_raw, "top_k", 8), seed = cfg_get_int(g_raw, "seed", 42), prompts = cfg_get_str_list(g_raw, "prompts"))
+
+  return AppConfig(project = cfg_get_str(root, "project", "mora-mini-llama"), version = cfg_get_str(root, "version", "1.0.0"), model = m_cfg, data = d_cfg, train = t_cfg, generate = g_cfg)
+end

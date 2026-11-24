@@ -1,0 +1,102 @@
+-- End-to-End Training Pipeline for Mini-LLaMA (RoPE + GQA + SwiGLU + AdamW + SafeTensors).
+
+import "std/nn/safetensors"
+import "src/config.mora"
+import "src/tokenizer.mora"
+import "src/data.mora"
+import "src/model.mora"
+import "src/optim.mora"
+import "src/checkpoint.mora"
+import "src/sampler.mora"
+
+task evaluate_val_loss(p: MiniLLaMAParams, cfg: ModelConfig, ds: TextDataset, batch_size: int, eval_batches: int, causal_mask: Tensor<f64, _, cpu>, rope_cos: Tensor<f64, _, cpu>, rope_sin: Tensor<f64, _, cpu>, rot_j: Tensor<f64, [2, 2], cpu>): float
+  let total_loss = 0.0
+  let b = 0
+  while b < eval_batches
+    let batch = make_batch(ds, true, b, batch_size)
+    let bl = eval_batch_loss(p, cfg, batch[0], batch[1], causal_mask, rope_cos, rope_sin, rot_j)
+    assign total_loss = total_loss + bl
+    assign b = b + 1
+  end
+  return total_loss / float(eval_batches)
+end
+
+task main()
+  let app = load_config("config/default.json")
+  let mcfg = app.model
+  let dcfg = app.data
+  let tcfg = app.train
+  let gcfg = app.generate
+
+  let tok = create_tokenizer()
+  assert_eq(tok.vocab_size, mcfg.vocab_size, "vocab_size mismatch between config and tokenizer")
+
+  let ds = load_dataset(dcfg.corpus_path, tok, mcfg.seq_len, dcfg.val_ratio, dcfg.seed)
+  let causal_mask = build_causal_mask(mcfg.seq_len)
+  let rope = build_rope_tables(mcfg.seq_len, mcfg.head_dim, mcfg.rope_theta)
+  let rope_cos = rope[0]
+  let rope_sin = rope[1]
+  let rot_j = build_rope_rot_matrix()
+
+  let params = init_model_params(mcfg, dcfg.seed)
+  let opt = init_adamw_state(params)
+  let n_params = count_parameters(params)
+
+  print("=== Mora Mini-LLaMA Training Pipeline ===")
+  print("arch:", mcfg.architecture, "| layers:", mcfg.n_layers, "| d_model:", mcfg.d_model, "| Q/KV heads:", mcfg.n_q_heads, "/", mcfg.n_kv_heads, "| params:", n_params)
+  print("corpus:", dcfg.corpus_path, "| train_windows:", ds.train_starts.len(), "| val_windows:", ds.val_starts.len(), "| batch_size:", dcfg.batch_size, "| seq_len:", mcfg.seq_len)
+
+  let vg_fn = value_and_grad(loss_fn, argnums = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+
+  let best_val_loss = 1000000000.0
+  let last_train_loss = 0.0
+  let step = 1
+
+  while step <= tcfg.total_steps
+    let batch = make_batch(ds, false, step - 1, dcfg.batch_size)
+    let bx = batch[0]
+    let by = batch[1]
+
+    let res = vg_fn(params.tok_emb, params.wq, params.wk, params.wv, params.wo, params.w_gate, params.w_up, params.w_down, params.attn_norm, params.ffn_norm, params.final_norm, params.lm_head, bx, by, causal_mask, rope_cos, rope_sin, rot_j, mcfg.n_layers, mcfg.n_q_heads, mcfg.n_kv_heads, mcfg.head_dim, mcfg.rms_eps)
+    let loss = float(res[0])
+    let grads: list<Tensor<f64, _, cpu>> = res[1]
+    assign last_train_loss = loss
+
+    let lr = cosine_warmup_lr(step, tcfg.warmup_steps, tcfg.total_steps, tcfg.max_lr, tcfg.min_lr)
+    let upd = adamw_update_all(params, opt, grads, lr, tcfg.beta1, tcfg.beta2, tcfg.eps, tcfg.weight_decay, tcfg.max_grad_norm)
+    assign params = upd.params
+    assign opt = upd.state
+
+    if step == 1 or step % tcfg.log_interval == 0 or step == tcfg.total_steps then
+      print("step", step, "/", tcfg.total_steps, "| lr =", lr, "| train_loss =", loss, "| grad_norm =", upd.grad_norm)
+    end
+
+    if step == 1 or step % tcfg.eval_interval == 0 or step == tcfg.total_steps then
+      let val_loss = evaluate_val_loss(params, mcfg, ds, dcfg.batch_size, tcfg.eval_batches, causal_mask, rope_cos, rope_sin, rot_j)
+      let val_ppl = math.exp(val_loss)
+      print("  [eval] step =", step, "| val_loss =", val_loss, "| val_ppl =", val_ppl)
+      if val_loss < best_val_loss then
+        assign best_val_loss = val_loss
+        let saved_bytes = save_checkpoint(tcfg.best_checkpoint, params, mcfg, step, loss, val_loss)
+        print("  [ckpt] saved best ->", tcfg.best_checkpoint, "(", saved_bytes, "bytes )")
+      end
+    end
+
+    assign step = step + 1
+  end
+
+  let latest_bytes = save_checkpoint(tcfg.latest_checkpoint, params, mcfg, tcfg.total_steps, last_train_loss, best_val_loss)
+  let hdr = inspect_checkpoint(tcfg.best_checkpoint)
+  print("=== Checkpoint Verified ===")
+  print("latest:", tcfg.latest_checkpoint, "(", latest_bytes, "bytes ) | best tensors:", hdr.tensors.len(), "| best val_loss:", best_val_loss)
+
+  let metrics: dict<string, any> = {}
+  assign metrics = metrics.set("project", app.project).set("architecture", mcfg.architecture).set("parameters", n_params).set("total_steps", tcfg.total_steps).set("final_train_loss", last_train_loss).set("best_val_loss", best_val_loss).set("best_val_ppl", math.exp(best_val_loss))
+  file.write_text(tcfg.metrics_path, json.stringify(metrics))
+
+  let preview_prompt = if gcfg.prompts.len() > 0 then gcfg.prompts[0] else "The transformer " end
+  let preview_out = generate_text(params, mcfg, tok, ds.eye_rows, causal_mask, rope_cos, rope_sin, rot_j, preview_prompt, 64, gcfg.temperature, gcfg.top_k, gcfg.seed)
+  print("=== Post-Training Generation Preview ===")
+  print("Prompt:", preview_prompt)
+  print("Output:", preview_out)
+end

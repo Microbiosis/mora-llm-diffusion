@@ -1,0 +1,348 @@
+-- =============================================================================
+-- Trainable Decoder-Only Transformer LLM (LLaMA-style) in Mora v0.111.0
+-- =============================================================================
+-- Target Version : Mora v0.111.0 (Phase P4 Stable Release)
+-- Architecture   : Token + Positional Embedding -> Pre-RMSNorm Transformer Block
+--                  (Multi-Head Causal Self-Attention + SwiGLU FFN) -> Final RMSNorm
+--                  -> LM Head -> Cross-Entropy Loss -> Reverse-Mode Autograd -> AdamW
+--
+-- Usage:
+--   mora --check trainable_llm.mora   # Static HM DType / Shape / Device / Purity check
+--   mora trainable_llm.mora           # Run end-to-end training, inference & checkpointing
+--
+-- GPU Note:
+--   This script defaults to `f64` on `cpu` for out-of-the-box portability on any machine.
+--   To train on NVIDIA CUDA / Vulkan / Apple Metal VRAM, replace `"cpu"` with `"cuda:0"`,
+--   `"vulkan:0"`, or `"metal:0"` (and switch `f64` -> `f32` with `f32` scalar suffixes
+--   for Vulkan/Metal hardware shaders).
+-- =============================================================================
+
+import "std/nn/safetensors"
+
+-- =============================================================================
+-- 1. Model Architecture (Compile-Time Const Generics + Static Shape Checking)
+-- =============================================================================
+
+struct Linear<const IN: int, const OUT: int>
+  weight: Tensor<f64, [IN, OUT], cpu>
+end
+
+impl<const IN: int, const OUT: int> Linear<IN, OUT>
+  task forward(self, x: Tensor<f64, [1, 4, IN], cpu>): Tensor<f64, [1, 4, OUT], cpu>
+    return x @ self.weight
+  end
+end
+
+struct RmsNorm<const D: int>
+  gamma: Tensor<f64, [D], cpu>
+end
+
+impl<const D: int> RmsNorm<D>
+  task forward(self, x: Tensor<f64, [1, 4, D], cpu>): Tensor<f64, [1, 4, D], cpu>
+    return x.rms_norm(1e-5) * self.gamma
+  end
+end
+
+-- LLaMA-style SwiGLU Feed-Forward Network: down(silu(gate(x)) * up(x))
+struct SwiGLU<const D: int, const H: int>
+  w_gate: Tensor<f64, [D, H], cpu>
+  w_up: Tensor<f64, [D, H], cpu>
+  w_down: Tensor<f64, [H, D], cpu>
+end
+
+impl<const D: int, const H: int> SwiGLU<D, H>
+  task forward(self, x: Tensor<f64, [1, 4, D], cpu>): Tensor<f64, [1, 4, D], cpu>
+    let gate = (x @ self.w_gate).silu()
+    let up = x @ self.w_up
+    return (gate * up) @ self.w_down
+  end
+end
+
+-- Multi-Head Causal Self-Attention (D=16, N_HEAD=2, HEAD_DIM=8, T=4)
+struct CausalSelfAttention
+  wq: Tensor<f64, [16, 16], cpu>
+  wk: Tensor<f64, [16, 16], cpu>
+  wv: Tensor<f64, [16, 16], cpu>
+  wo: Tensor<f64, [16, 16], cpu>
+end
+
+impl CausalSelfAttention
+  task forward(self, x: Tensor<f64, [1, 4, 16], cpu>, causal_mask: Tensor<f64, [4, 4], cpu>): Tensor<f64, [1, 4, 16], cpu>
+    -- Project to Q, K, V and split into [B=1, N_HEAD=2, T=4, HEAD_DIM=8]
+    let q = (x @ self.wq).reshape([1, 4, 2, 8]).transpose(1, 2)
+    let k = (x @ self.wk).reshape([1, 4, 2, 8]).transpose(1, 2)
+    let v = (x @ self.wv).reshape([1, 4, 2, 8]).transpose(1, 2)
+
+    -- Scaled Dot-Product Attention with causal mask (1 / sqrt(8) ~= 0.35355339)
+    let scale = 0.3535533905932738
+    let scores = (q @ k.transpose(-2, -1)) * scale + causal_mask
+    let attn_weights = scores.softmax()
+    let context = attn_weights @ v
+
+    -- Merge heads back to [B=1, T=4, D=16] and apply output projection
+    let merged = context.transpose(1, 2).reshape([1, 4, 16])
+    return merged @ self.wo
+  end
+end
+
+-- Decoder-Only Transformer Block (Pre-Norm Residual Architecture, D=16, H=const)
+struct TransformerBlock<const H: int>
+  attn_norm: RmsNorm<16>
+  attn: CausalSelfAttention
+  ffn_norm: RmsNorm<16>
+  ffn: SwiGLU<16, H>
+end
+
+impl<const H: int> TransformerBlock<H>
+  task forward(self, x: Tensor<f64, [1, 4, 16], cpu>, causal_mask: Tensor<f64, [4, 4], cpu>): Tensor<f64, [1, 4, 16], cpu>
+    let h = x + self.attn.forward(self.attn_norm.forward(x), causal_mask)
+    return h + self.ffn.forward(self.ffn_norm.forward(h))
+  end
+end
+
+-- Complete Mini-LLM (Vocab=const V, SeqLen=4, Dim=16, Heads=2, HeadDim=8, Hidden=const H)
+struct MiniLLM<const V: int, const H: int>
+  tok_emb: Tensor<f64, [V, 16], cpu>
+  pos_emb: Tensor<f64, [1, 4, 16], cpu>
+  block: TransformerBlock<H>
+  final_norm: RmsNorm<16>
+  lm_head: Linear<16, V>
+end
+
+impl<const V: int, const H: int> MiniLLM<V, H>
+  task forward(self, x_onehot: Tensor<f64, [1, 4, V], cpu>, causal_mask: Tensor<f64, [4, 4], cpu>): Tensor<f64, [1, 4, V], cpu>
+    -- Differentiable token embedding lookup via one-hot contraction [1, T, V] @ [V, 16]
+    let h0 = (x_onehot @ self.tok_emb) + self.pos_emb
+    let h1 = self.block.forward(h0, causal_mask)
+    let h_norm = self.final_norm.forward(h1)
+    return self.lm_head.forward(h_norm)
+  end
+end
+
+-- =============================================================================
+-- 2. Pure-Mora AdamW Optimizer Step (Shape-Polymorphic via `_`)
+-- =============================================================================
+
+task adamw_step(p: Tensor<f64, _, cpu>, g: Tensor<f64, _, cpu>, m: Tensor<f64, _, cpu>, v: Tensor<f64, _, cpu>, lr: float, beta1: float, beta2: float, eps: float, wd: float, bc1: float, bc2: float): list<Tensor<f64, _, cpu>>
+  let m_new = m * beta1 + g * (1.0 - beta1)
+  let v_new = v * beta2 + (g * g) * (1.0 - beta2)
+  let m_hat = m_new / bc1
+  let v_hat = v_new / bc2
+  let p_new = p * (1.0 - lr * wd) - (m_hat / (v_hat.sqrt() + eps)) * lr
+  return [p_new, m_new, v_new]
+end
+
+-- =============================================================================
+-- 3. Synthetic Next-Token Prediction Dataset & Causal Mask
+-- =============================================================================
+-- Toy sequence (Vocab = 8, SeqLen = 4):
+--   Input  tokens : [0, 1, 2, 3]
+--   Target tokens : [1, 2, 3, 4]  (next-token prediction)
+
+let x_onehot = tensor([[[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]]], dtype = "f64", device = "cpu")
+
+let y_onehot = tensor([[[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]]], dtype = "f64", device = "cpu")
+
+let causal_mask = tensor([[0.0, -1e9, -1e9, -1e9], [0.0, 0.0, -1e9, -1e9], [0.0, 0.0, 0.0, -1e9], [0.0, 0.0, 0.0, 0.0]], dtype = "f64", device = "cpu")
+
+-- =============================================================================
+-- 4. Parameter Initialization (Scaled Normal) & AdamW Moment Buffers
+-- =============================================================================
+
+let init_scale = 0.2
+
+let tok_emb    = Tensor::randn([8, 16], "f64", "cpu") * init_scale
+let pos_emb    = Tensor::randn([1, 4, 16], "f64", "cpu") * init_scale
+let attn_norm  = Tensor::ones([16], "f64", "cpu")
+let wq         = Tensor::randn([16, 16], "f64", "cpu") * init_scale
+let wk         = Tensor::randn([16, 16], "f64", "cpu") * init_scale
+let wv         = Tensor::randn([16, 16], "f64", "cpu") * init_scale
+let wo         = Tensor::randn([16, 16], "f64", "cpu") * init_scale
+let ffn_norm   = Tensor::ones([16], "f64", "cpu")
+let w_gate     = Tensor::randn([16, 32], "f64", "cpu") * init_scale
+let w_up       = Tensor::randn([16, 32], "f64", "cpu") * init_scale
+let w_down     = Tensor::randn([32, 16], "f64", "cpu") * init_scale
+let final_norm = Tensor::ones([16], "f64", "cpu")
+let lm_head    = Tensor::randn([16, 8], "f64", "cpu") * init_scale
+
+-- First-moment (m) and second-moment (v) buffers for AdamW
+let m0  = Tensor::zeros([8, 16], "f64", "cpu")
+let v0  = Tensor::zeros([8, 16], "f64", "cpu")
+let m1  = Tensor::zeros([1, 4, 16], "f64", "cpu")
+let v1  = Tensor::zeros([1, 4, 16], "f64", "cpu")
+let m2  = Tensor::zeros([16], "f64", "cpu")
+let v2  = Tensor::zeros([16], "f64", "cpu")
+let m3  = Tensor::zeros([16, 16], "f64", "cpu")
+let v3  = Tensor::zeros([16, 16], "f64", "cpu")
+let m4  = Tensor::zeros([16, 16], "f64", "cpu")
+let v4  = Tensor::zeros([16, 16], "f64", "cpu")
+let m5  = Tensor::zeros([16, 16], "f64", "cpu")
+let v5  = Tensor::zeros([16, 16], "f64", "cpu")
+let m6  = Tensor::zeros([16, 16], "f64", "cpu")
+let v6  = Tensor::zeros([16, 16], "f64", "cpu")
+let m7  = Tensor::zeros([16], "f64", "cpu")
+let v7  = Tensor::zeros([16], "f64", "cpu")
+let m8  = Tensor::zeros([16, 32], "f64", "cpu")
+let v8  = Tensor::zeros([16, 32], "f64", "cpu")
+let m9  = Tensor::zeros([16, 32], "f64", "cpu")
+let v9  = Tensor::zeros([16, 32], "f64", "cpu")
+let m10 = Tensor::zeros([32, 16], "f64", "cpu")
+let v10 = Tensor::zeros([32, 16], "f64", "cpu")
+let m11 = Tensor::zeros([16], "f64", "cpu")
+let v11 = Tensor::zeros([16], "f64", "cpu")
+let m12 = Tensor::zeros([16, 8], "f64", "cpu")
+let v12 = Tensor::zeros([16, 8], "f64", "cpu")
+
+-- =============================================================================
+-- 5. Differentiable Cross-Entropy Loss Function (Functional Autograd Style)
+-- =============================================================================
+
+task loss_fn(p_tok_emb: Tensor<f64, [8, 16], cpu>, p_pos_emb: Tensor<f64, [1, 4, 16], cpu>, p_attn_norm: Tensor<f64, [16], cpu>, p_wq: Tensor<f64, [16, 16], cpu>, p_wk: Tensor<f64, [16, 16], cpu>, p_wv: Tensor<f64, [16, 16], cpu>, p_wo: Tensor<f64, [16, 16], cpu>, p_ffn_norm: Tensor<f64, [16], cpu>, p_w_gate: Tensor<f64, [16, 32], cpu>, p_w_up: Tensor<f64, [16, 32], cpu>, p_w_down: Tensor<f64, [32, 16], cpu>, p_final_norm: Tensor<f64, [16], cpu>, p_lm_head: Tensor<f64, [16, 8], cpu>): float
+  let block = TransformerBlock<32>(attn_norm = RmsNorm<16>(gamma = p_attn_norm), attn = CausalSelfAttention(wq = p_wq, wk = p_wk, wv = p_wv, wo = p_wo), ffn_norm = RmsNorm<16>(gamma = p_ffn_norm), ffn = SwiGLU<16, 32>(w_gate = p_w_gate, w_up = p_w_up, w_down = p_w_down))
+  let model = MiniLLM<8, 32>(tok_emb = p_tok_emb, pos_emb = p_pos_emb, block = block, final_norm = RmsNorm<16>(gamma = p_final_norm), lm_head = Linear<16, 8>(weight = p_lm_head))
+
+  let logits = model.forward(x_onehot, causal_mask)
+  let probs = logits.softmax()
+  let log_probs = (probs + 1e-9).ln()
+  -- Mean negative log-likelihood across T = 4 positions
+  return -(y_onehot * log_probs).sum() / 4.0
+end
+
+let vg_fn = value_and_grad(loss_fn, argnums=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+
+-- =============================================================================
+-- 6. Training Loop (Forward -> Loss -> Reverse-Mode Backprop -> AdamW Update)
+-- =============================================================================
+
+let lr = 0.03
+let beta1 = 0.9
+let beta2 = 0.999
+let eps = 1e-8
+let wd = 0.01
+let total_steps = 40
+
+let step = 1
+let beta1_pow = 1.0
+let beta2_pow = 1.0
+
+print("=== Training Mini-LLM (Mora v0.111.0, LLaMA-style Transformer) ===")
+
+while step <= total_steps
+  let res = vg_fn(tok_emb, pos_emb, attn_norm, wq, wk, wv, wo, ffn_norm, w_gate, w_up, w_down, final_norm, lm_head)
+  let loss = res[0]
+  let grads = res[1]
+
+  if step == 1 or step % 10 == 0 or step == total_steps then
+    print("step =", step, "cross_entropy_loss =", loss)
+  end
+
+  assign beta1_pow = beta1_pow * beta1
+  assign beta2_pow = beta2_pow * beta2
+  let bc1 = 1.0 - beta1_pow
+  let bc2 = 1.0 - beta2_pow
+
+  let u0  = adamw_step(tok_emb,    grads[0],  m0,  v0,  lr, beta1, beta2, eps, wd,  bc1, bc2)
+  assign tok_emb = u0[0]
+  assign m0 = u0[1]
+  assign v0 = u0[2]
+
+  let u1  = adamw_step(pos_emb,    grads[1],  m1,  v1,  lr, beta1, beta2, eps, wd,  bc1, bc2)
+  assign pos_emb = u1[0]
+  assign m1 = u1[1]
+  assign v1 = u1[2]
+
+  let u2  = adamw_step(attn_norm,  grads[2],  m2,  v2,  lr, beta1, beta2, eps, 0.0, bc1, bc2)
+  assign attn_norm = u2[0]
+  assign m2 = u2[1]
+  assign v2 = u2[2]
+
+  let u3  = adamw_step(wq,         grads[3],  m3,  v3,  lr, beta1, beta2, eps, wd,  bc1, bc2)
+  assign wq = u3[0]
+  assign m3 = u3[1]
+  assign v3 = u3[2]
+
+  let u4  = adamw_step(wk,         grads[4],  m4,  v4,  lr, beta1, beta2, eps, wd,  bc1, bc2)
+  assign wk = u4[0]
+  assign m4 = u4[1]
+  assign v4 = u4[2]
+
+  let u5  = adamw_step(wv,         grads[5],  m5,  v5,  lr, beta1, beta2, eps, wd,  bc1, bc2)
+  assign wv = u5[0]
+  assign m5 = u5[1]
+  assign v5 = u5[2]
+
+  let u6  = adamw_step(wo,         grads[6],  m6,  v6,  lr, beta1, beta2, eps, wd,  bc1, bc2)
+  assign wo = u6[0]
+  assign m6 = u6[1]
+  assign v6 = u6[2]
+
+  let u7  = adamw_step(ffn_norm,   grads[7],  m7,  v7,  lr, beta1, beta2, eps, 0.0, bc1, bc2)
+  assign ffn_norm = u7[0]
+  assign m7 = u7[1]
+  assign v7 = u7[2]
+
+  let u8  = adamw_step(w_gate,     grads[8],  m8,  v8,  lr, beta1, beta2, eps, wd,  bc1, bc2)
+  assign w_gate = u8[0]
+  assign m8 = u8[1]
+  assign v8 = u8[2]
+
+  let u9  = adamw_step(w_up,       grads[9],  m9,  v9,  lr, beta1, beta2, eps, wd,  bc1, bc2)
+  assign w_up = u9[0]
+  assign m9 = u9[1]
+  assign v9 = u9[2]
+
+  let u10 = adamw_step(w_down,     grads[10], m10, v10, lr, beta1, beta2, eps, wd,  bc1, bc2)
+  assign w_down = u10[0]
+  assign m10 = u10[1]
+  assign v10 = u10[2]
+
+  let u11 = adamw_step(final_norm, grads[11], m11, v11, lr, beta1, beta2, eps, 0.0, bc1, bc2)
+  assign final_norm = u11[0]
+  assign m11 = u11[1]
+  assign v11 = u11[2]
+
+  let u12 = adamw_step(lm_head,    grads[12], m12, v12, lr, beta1, beta2, eps, wd,  bc1, bc2)
+  assign lm_head = u12[0]
+  assign m12 = u12[1]
+  assign v12 = u12[2]
+
+  assign step = step + 1
+end
+
+-- =============================================================================
+-- 7. Post-Training Inference (`no_grad`) & SafeTensors Checkpoint Serialization
+-- =============================================================================
+
+let trained_probs = no_grad
+  let eval_block = TransformerBlock<32>(attn_norm = RmsNorm<16>(gamma = attn_norm), attn = CausalSelfAttention(wq = wq, wk = wk, wv = wv, wo = wo), ffn_norm = RmsNorm<16>(gamma = ffn_norm), ffn = SwiGLU<16, 32>(w_gate = w_gate, w_up = w_up, w_down = w_down))
+  let eval_model = MiniLLM<8, 32>(tok_emb = tok_emb, pos_emb = pos_emb, block = eval_block, final_norm = RmsNorm<16>(gamma = final_norm), lm_head = Linear<16, 8>(weight = lm_head))
+  eval_model.forward(x_onehot, causal_mask).softmax()
+end
+
+print("=== Post-Training Predicted Probabilities [1, T=4, V=8] ===")
+print(trained_probs.to_list())
+
+-- Export trained checkpoint to standard SafeTensors binary buffer (`std/nn/safetensors`)
+let ckpt: dict<string, any> = {}
+assign ckpt = ckpt.set("tok_emb.weight", tok_emb)
+assign ckpt = ckpt.set("pos_emb.weight", pos_emb)
+assign ckpt = ckpt.set("blk.0.attn_norm.weight", attn_norm)
+assign ckpt = ckpt.set("blk.0.attn.wq.weight", wq)
+assign ckpt = ckpt.set("blk.0.attn.wk.weight", wk)
+assign ckpt = ckpt.set("blk.0.attn.wv.weight", wv)
+assign ckpt = ckpt.set("blk.0.attn.wo.weight", wo)
+assign ckpt = ckpt.set("blk.0.ffn_norm.weight", ffn_norm)
+assign ckpt = ckpt.set("blk.0.ffn.w_gate.weight", w_gate)
+assign ckpt = ckpt.set("blk.0.ffn.w_up.weight", w_up)
+assign ckpt = ckpt.set("blk.0.ffn.w_down.weight", w_down)
+assign ckpt = ckpt.set("final_norm.weight", final_norm)
+assign ckpt = ckpt.set("lm_head.weight", lm_head)
+
+let ckpt_meta: dict<string, string> = {"architecture": "mora-mini-llm-llama", "mora_version": "0.111.0", "vocab_size": "8", "seq_len": "4", "d_model": "16", "n_heads": "2"}
+
+let st_bytes = match safetensors_encode(ckpt, ckpt_meta) with
+  SafetensorsResult::Ok(b) -> b
+  SafetensorsResult::Err(_) -> Tensor::zeros([0], dtype = "u8")
+end
+
+print("Encoded SafeTensors checkpoint size (bytes):", st_bytes.numel())

@@ -1,0 +1,100 @@
+-- Disk SafeTensors Checkpoint Serialization & Deserialization for Multi-Layer Mini-LLaMA.
+
+import "std/nn/safetensors"
+import "src/config.mora"
+import "src/model.mora"
+
+export struct LoadedCheckpoint
+  params: MiniLLaMAParams
+  metadata: dict<string, string>
+  step: int = 0
+  val_loss: float = 0.0
+end
+
+task ensure_parent_dir(path: string)
+  let dir = file.dirname(path)
+  if dir != "" and !file.exists(dir) then
+    file.mkdir_all(dir)
+  end
+end
+
+export task save_checkpoint(path: string, p: MiniLLaMAParams, cfg: ModelConfig, step: int, train_loss: float, val_loss: float): int
+  ensure_parent_dir(path)
+
+  let tensors: dict<string, any> = {}
+  assign tensors = tensors.set("tok_emb.weight", p.tok_emb)
+  assign tensors = tensors.set("final_norm.weight", p.final_norm)
+  assign tensors = tensors.set("lm_head.weight", p.lm_head)
+
+  let l = 0
+  while l < cfg.n_layers
+    let prefix = "blk." + str(l) + "."
+    assign tensors = tensors.set(prefix + "attn_norm.weight", p.attn_norm[l])
+    assign tensors = tensors.set(prefix + "attn.wq.weight", p.wq[l])
+    assign tensors = tensors.set(prefix + "attn.wk.weight", p.wk[l])
+    assign tensors = tensors.set(prefix + "attn.wv.weight", p.wv[l])
+    assign tensors = tensors.set(prefix + "attn.wo.weight", p.wo[l])
+    assign tensors = tensors.set(prefix + "ffn_norm.weight", p.ffn_norm[l])
+    assign tensors = tensors.set(prefix + "ffn.w_gate.weight", p.w_gate[l])
+    assign tensors = tensors.set(prefix + "ffn.w_up.weight", p.w_up[l])
+    assign tensors = tensors.set(prefix + "ffn.w_down.weight", p.w_down[l])
+    assign l = l + 1
+  end
+
+  let meta: dict<string, string> = {"architecture": cfg.architecture, "mora_version": "0.111.0", "vocab_size": str(cfg.vocab_size), "seq_len": str(cfg.seq_len), "n_layers": str(cfg.n_layers), "d_model": str(cfg.d_model), "n_q_heads": str(cfg.n_q_heads), "n_kv_heads": str(cfg.n_kv_heads), "head_dim": str(cfg.head_dim), "ffn_hidden": str(cfg.ffn_hidden), "step": str(step), "train_loss": str(train_loss), "val_loss": str(val_loss)}
+
+  let res = safetensors_save(path, tensors, meta)
+  return match res with
+      SafetensorsResult::Ok(nbytes) -> nbytes
+      SafetensorsResult::Err(msg) -> 0
+    end
+  end
+
+  task require_tensor(tensors: dict<string, any>, name: string): Tensor<f64, _, cpu>
+    let t = tensors.get(name)
+    assert(type_of(t) == "tensor", "missing tensor in checkpoint: " + name)
+    return t.contiguous()
+  end
+
+  task stack_layer_tensors(tensors: dict<string, any>, n_layers: int, suffix: string): Tensor<f64, _, cpu>
+    let parts: list<Tensor<f64, _, cpu>> = []
+    let l = 0
+    while l < n_layers
+      let t = require_tensor(tensors, "blk." + str(l) + "." + suffix)
+      let shp: list<int> = [1]
+      for dim in t.shape()
+        assign shp = shp.push(int(dim))
+      end
+      assign parts = parts.push(t.reshape(shp))
+      assign l = l + 1
+    end
+    return Tensor::cat(parts, 0)
+  end
+
+  export task load_checkpoint(path: string, n_layers: int, device: string = "cpu"): LoadedCheckpoint
+    let res = safetensors_load(path, device)
+    let sf: SafetensorsFile = match res with
+        SafetensorsResult::Ok(f) -> f
+        SafetensorsResult::Err(msg) -> SafetensorsFile(metadata = {}, headers = {}, tensors = {})
+      end
+      assert(sf.tensors.len() > 0, "failed to load SafeTensors checkpoint: " + path)
+
+      let ts = sf.tensors
+      let p = MiniLLaMAParams(tok_emb = require_tensor(ts, "tok_emb.weight"), wq = stack_layer_tensors(ts, n_layers, "attn.wq.weight"), wk = stack_layer_tensors(ts, n_layers, "attn.wk.weight"), wv = stack_layer_tensors(ts, n_layers, "attn.wv.weight"), wo = stack_layer_tensors(ts, n_layers, "attn.wo.weight"), w_gate = stack_layer_tensors(ts, n_layers, "ffn.w_gate.weight"), w_up = stack_layer_tensors(ts, n_layers, "ffn.w_up.weight"), w_down = stack_layer_tensors(ts, n_layers, "ffn.w_down.weight"), attn_norm = stack_layer_tensors(ts, n_layers, "attn_norm.weight"), ffn_norm = stack_layer_tensors(ts, n_layers, "ffn_norm.weight"), final_norm = require_tensor(ts, "final_norm.weight"), lm_head = require_tensor(ts, "lm_head.weight"))
+
+      let meta = sf.metadata
+      let step_v = meta.get("step")
+      let step_num = if step_v == nil then 0 else int(str(step_v)) end
+      let val_v = meta.get("val_loss")
+      let val_num = if val_v == nil then 0.0 else float(str(val_v)) end
+
+      return LoadedCheckpoint(params = p, metadata = meta, step = step_num, val_loss = val_num)
+    end
+
+    export task inspect_checkpoint(path: string): SafetensorsHeader
+      let res = safetensors_inspect(path)
+      return match res with
+          SafetensorsResult::Ok(h) -> h
+          SafetensorsResult::Err(msg) -> SafetensorsHeader(header_len = 0, data_offset = 8, metadata = {}, tensors = {})
+        end
+      end

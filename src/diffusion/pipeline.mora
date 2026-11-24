@@ -1,0 +1,328 @@
+-- Unified CAD-BEBC Pipeline:
+-- Fully Differentiable Parameter Learning (all weights via backprop, gated by m_ok / m_fail).
+
+import "std/net/http"
+import "std/nn/safetensors"
+import "src/config.mora"
+import "src/tokenizer.mora"
+import "src/data.mora"
+import "src/model.mora"
+import "src/checkpoint.mora"
+import "src/sampler.mora"
+import "src/latent_codec.mora"
+import "src/diffusion/config.mora"
+import "src/diffusion/causal_graph.mora"
+import "src/diffusion/backbone.mora"
+import "src/diffusion/shortcut.mora"
+import "src/diffusion/expert.mora"
+
+export struct InternalizedDiffusionSystem
+  cfg: DiffusionAppConfig
+  backbone: BackboneParams
+  w_blk: Tensor<f64, _, cpu>
+  p_blk: Tensor<f64, _, cpu>
+  off_diag: Tensor<f64, _, cpu>
+  prefix_mask: Tensor<f64, _, cpu>
+  u_all: Tensor<f64, _, cpu>
+  v_all: Tensor<f64, _, cpu>
+  wg_all: Tensor<f64, _, cpu>
+  bg_all: Tensor<f64, _, cpu>
+  w_comp: Tensor<f64, _, cpu>
+  b_comp: Tensor<f64, _, cpu>
+  expert: ExternalFastExpert
+  total_steps: int = 0
+end
+
+export struct EmergeStepResult
+  system: InternalizedDiffusionSystem
+  int_loss: float = 0.0
+  e_base: float = 0.0
+  m_ok_mean: float = 0.0
+  m_fail: float = 0.0
+end
+
+export struct TextGenResult
+  text: string = ""
+  path_mode: string = "internal_shortened"
+  backbone_nfe: int = 8
+  shortcuts_used: int = 0
+end
+
+export struct InferResult
+  output: Tensor<f64, _, cpu>
+  path_mode: string = "internal_short"
+  backbone_nfe: int = 8
+  shortcuts_used: int = 0
+  pi_int: float = 0.0
+  g_int: float = 0.0
+end
+
+export task init_diffusion_system(cfg: DiffusionAppConfig): InternalizedDiffusionSystem
+  let mc = cfg.model
+  let sc = cfg.schedule
+  random.seed(sc.seed)
+
+  let p_blk = build_block_projection(mc.num_blocks, mc.block_size)
+  let off_diag = build_off_diag_mask(mc.num_blocks)
+  let prefix_mask = build_prefix_causal_mask(mc.num_blocks, mc.block_size, mc.prefix_blocks)
+  let w_blk = init_w_blk(off_diag, mc.init_iso)
+  let init_bias = struct_bias_from_wblk(w_blk, p_blk, off_diag, prefix_mask)
+
+  let bp0 = init_backbone_params(mc, sc.seed)
+  let bp = pretrain_backbone(bp0, mc, init_bias, sc.pretrain_steps, sc.pretrain_lr, sc.seed)
+
+  let u_all = Tensor::randn([3, mc.d_model, mc.shortcut_rank], "f64", "cpu") * 0.01
+  let v_all = Tensor::zeros([3, mc.d_model, mc.shortcut_rank], "f64", "cpu")
+  let wg_all = Tensor::zeros([3, mc.d_model], "f64", "cpu")
+  let bg_all = Tensor::full([3], mc.b_rest, "f64", "cpu")
+
+  let w_comp = Tensor::zeros([mc.d_model], "f64", "cpu")
+  let b_comp = Tensor::full([1], mc.init_comp_bias, "f64", "cpu")
+
+  let exp = load_external_expert(cfg.external_expert, mc.rms_eps, "cpu")
+
+  return InternalizedDiffusionSystem(cfg = cfg, backbone = bp, w_blk = w_blk, p_blk = p_blk, off_diag = off_diag, prefix_mask = prefix_mask, u_all = u_all, v_all = v_all, wg_all = wg_all, bg_all = bg_all, w_comp = w_comp, b_comp = b_comp, expert = exp, total_steps = 0)
+end
+
+task ode_step_tracked(bp: BackboneParams, z: Tensor<f64, _, cpu>, step_t: int, bias: Tensor<f64, _, cpu>, mc: DiffModelConfig): Tensor<f64, _, cpu>
+  let tau_t = Tensor::full([1, 1], float(step_t) / float(mc.num_steps), "f64", "cpu")
+  let x0h = backbone_forward_raw(bp.in_proj, bp.pos_emb, bp.time_proj, bp.attn_norm, bp.wq, bp.wk, bp.wv, bp.wo, bp.ffn_norm, bp.w_gate, bp.w_up, bp.w_down, bp.out_norm, bp.out_proj, z, tau_t, bias, mc.n_layers, mc.n_heads, mc.head_dim, mc.rms_eps)
+  return z + (x0h - z) * (1.0 / float(step_t))
+end
+
+export task unified_diff_loss(p_wblk: Tensor<f64, _, cpu>, p_u: Tensor<f64, _, cpu>, p_v: Tensor<f64, _, cpu>, p_wg: Tensor<f64, _, cpu>, p_bg: Tensor<f64, _, cpu>, p_wcomp: Tensor<f64, _, cpu>, p_bcomp: Tensor<f64, _, cpu>, bp: BackboneParams, x_obs: Tensor<f64, _, cpu>, x_0: Tensor<f64, _, cpu>, y_ext: Tensor<f64, _, cpu>, seg_entries: list<Tensor<f64, _, cpu>>, seg_targets: list<Tensor<f64, _, cpu>>, z_pre_final: Tensor<f64, _, cpu>, p_blk: Tensor<f64, _, cpu>, off_diag: Tensor<f64, _, cpu>, prefix_mask: Tensor<f64, _, cpu>, mc: DiffModelConfig, pc: PlasticityConfig): float
+  let bias = struct_bias_from_wblk(p_wblk, p_blk, off_diag, prefix_mask)
+  let y_int = ode_step_tracked(bp, z_pre_final, 1, bias, mc)
+  let pi_int = ((x_obs.rms_norm(mc.rms_eps) * p_wcomp).mean() + p_bcomp).sigmoid()
+  let y_mix = y_int * pi_int + y_ext * (1.0 - pi_int)
+  let d_mix = y_mix - x_0
+  let d_int = y_int - x_0
+  let recon = (d_mix * d_mix).mean() + 0.5 * (d_int * d_int).mean() + pc.lambda_ext_bias * pi_int.sum()
+
+  let align = 0.0
+  let gate_sup = 0.0
+  let k = 0
+  while k < 3
+    let pred = shortcut_apply(seg_entries[k], p_u[k], p_v[k], mc.rms_eps)
+    let d = pred - seg_targets[k]
+    let e_align = (d * d).mean()
+    assign align = align + e_align
+
+    -- Differentiable gate supervision: encourage high gate when alignment is good
+    let z_bar = pool_mean_feature(seg_entries[k], mc.rms_eps)
+    let logit = (z_bar * p_wg[k]).mean() + p_bg[k]
+    let g = logit.sigmoid()
+    let target = (pc.eps_shortcut - e_align).sigmoid()
+    let ge = g - target
+    assign gate_sup = gate_sup + (ge * ge).mean()
+    assign k = k + 1
+  end
+  return recon + 0.3 * align + 1.2 * gate_sup
+end
+
+task stack_3_2d(t0: Tensor<f64, _, cpu>, t1: Tensor<f64, _, cpu>, t2: Tensor<f64, _, cpu>): Tensor<f64, _, cpu>
+  let shp = t0.shape()
+  let s1: list<int> = [1]
+  for d in shp
+    assign s1 = s1.push(int(d))
+  end
+  return Tensor::cat([t0.reshape(s1), t1.reshape(s1), t2.reshape(s1)], 0)
+end
+
+task stack_3_1d(t0: Tensor<f64, _, cpu>, t1: Tensor<f64, _, cpu>, t2: Tensor<f64, _, cpu>): Tensor<f64, _, cpu>
+  return Tensor::cat([t0.reshape([1, t0.numel()]), t1.reshape([1, t1.numel()]), t2.reshape([1, t2.numel()])], 0)
+end
+
+task clamp_wblk(w: Tensor<f64, _, cpu>, off_diag: Tensor<f64, _, cpu>, init_iso: float): Tensor<f64, _, cpu>
+  let rows: list<any> = w.to_list()
+  let mask_rows: list<any> = off_diag.to_list()
+  let k = rows.len()
+  let out_rows: list<list<float>> = []
+  let i = 0
+  while i < k
+    let row: list<any> = rows[i]
+    let mrow: list<any> = mask_rows[i]
+    let out_r: list<float> = []
+    let j = 0
+    while j < k
+      if float(mrow[j]) < 0.5 then
+        assign out_r = out_r.push(0.0)
+      else
+        let v = float(row[j])
+        if v < -init_iso then
+          assign v = -init_iso
+        end
+        if v > 0.0 then
+          assign v = 0.0
+        end
+        assign out_r = out_r.push(v)
+      end
+      assign j = j + 1
+    end
+    assign out_rows = out_rows.push(out_r)
+    assign i = i + 1
+  end
+  return Tensor::from_list(out_rows, "f64")
+end
+
+export task emerge_step(sys: InternalizedDiffusionSystem, x_obs: Tensor<f64, _, cpu>, x_0: Tensor<f64, _, cpu>, seed: int): EmergeStepResult
+  let mc = sys.cfg.model
+  let pc = sys.cfg.plasticity
+  let bias = struct_bias_from_wblk(sys.w_blk, sys.p_blk, sys.off_diag, sys.prefix_mask)
+
+  let y_ext = expert_predict(sys.expert, x_obs)
+
+  let z = no_grad
+  backbone_ode_step(sys.backbone, mc, x_obs, mc.num_steps, bias)
+end
+
+let seg_entries: list<Tensor<f64, _, cpu>> = []
+let seg_targets: list<Tensor<f64, _, cpu>> = []
+let seg = 0
+let t_cur = mc.num_steps - 1
+while seg < 3
+  let z_entry = z
+  let z1 = no_grad
+  backbone_ode_step(sys.backbone, mc, z, t_cur, bias)
+end
+let z2 = no_grad
+backbone_ode_step(sys.backbone, mc, z1, t_cur - 1, bias)
+end
+assign seg_entries = seg_entries.push(z_entry)
+assign seg_targets = seg_targets.push(z2)
+assign z = z2
+assign t_cur = t_cur - 2
+assign seg = seg + 1
+end
+let z_pre_final = z
+let y_int = no_grad
+backbone_ode_step(sys.backbone, mc, z_pre_final, 1, bias)
+end
+
+let e_base = compute_consistency_error(sys.backbone, mc, x_obs, y_int, bias, seed + 19)
+let m_low = deadzone_low_gate(e_base, pc)
+let m_fail = deadzone_fail_gate(e_base, pc)
+
+-- Fully differentiable update: single value_and_grad over all plasticity parameters
+let vg = value_and_grad(unified_diff_loss, argnums = [0, 1, 2, 3, 4, 5, 6])
+let res = vg(sys.w_blk, sys.u_all, sys.v_all, sys.wg_all, sys.bg_all, sys.w_comp, sys.b_comp, sys.backbone, x_obs, x_0, y_ext, seg_entries, seg_targets, z_pre_final, sys.p_blk, sys.off_diag, sys.prefix_mask, mc, pc)
+let int_loss = float(res[0])
+let gs: list<Tensor<f64, _, cpu>> = res[1]
+
+let g_wblk = gs[0]
+let g_u = gs[1]
+let g_v = gs[2]
+let g_wg = gs[3]
+let g_bg = gs[4]
+let g_wcomp = gs[5]
+let g_bcomp = gs[6]
+
+-- Apply gated step sizes (slow growth / faster fallback)
+let step_ok = m_low
+let step_fail = m_fail
+
+let w_iso = sys.off_diag * (-mc.init_iso)
+let w_blk_raw = sys.w_blk - g_wblk * (pc.eta_conn * step_ok) - (sys.w_blk - w_iso) * (pc.lambda_conn * step_fail)
+let w_blk_next = clamp_wblk(w_blk_raw, sys.off_diag, mc.init_iso)
+
+let u_next = sys.u_all * (1.0 - pc.lambda_decay * step_fail) - g_u * (pc.eta_lr * step_ok)
+let v_next = sys.v_all * (1.0 - pc.lambda_decay * step_fail) - g_v * (pc.eta_lr * step_ok)
+
+let wg_next = sys.wg_all * (1.0 - pc.lambda_g * step_fail) - g_wg * (pc.eta_g * step_ok)
+let bg_raw = sys.bg_all - g_bg * (pc.eta_b * step_ok) - (sys.bg_all - mc.b_rest) * (pc.lambda_b * step_fail)
+let bg_list: list<float> = []
+let bi = 0
+while bi < 3
+  let bv = float(bg_raw[bi])
+  if bv < mc.b_rest then
+    assign bv = mc.b_rest
+  end
+  if bv > mc.b_max then
+    assign bv = mc.b_max
+  end
+  assign bg_list = bg_list.push(bv)
+  assign bi = bi + 1
+end
+let bg_next = Tensor::from_list(bg_list, "f64")
+
+let w_comp_next = sys.w_comp * (1.0 - pc.lambda_g * step_fail) - g_wcomp * (pc.eta_comp * step_ok)
+let b_comp_val = float(sys.b_comp.item()) - float(g_bcomp.item()) * (pc.eta_comp * step_ok) - pc.lambda_b * step_fail * (float(sys.b_comp.item()) - mc.init_comp_bias)
+let b_comp_next = Tensor::full([1], b_comp_val, "f64", "cpu")
+
+let next_sys = InternalizedDiffusionSystem(cfg = sys.cfg, backbone = sys.backbone, w_blk = w_blk_next, p_blk = sys.p_blk, off_diag = sys.off_diag, prefix_mask = sys.prefix_mask, u_all = u_next, v_all = v_next, wg_all = wg_next, bg_all = bg_next, w_comp = w_comp_next, b_comp = b_comp_next, expert = sys.expert, total_steps = sys.total_steps + 1)
+return EmergeStepResult(system = next_sys, int_loss = int_loss, e_base = e_base, m_ok_mean = step_ok, m_fail = step_fail)
+end
+
+export task comp_gate_scalar(sys: InternalizedDiffusionSystem, x_obs: Tensor<f64, _, cpu>): float
+  let logit = no_grad
+  float((x_obs.rms_norm(sys.cfg.model.rms_eps) * sys.w_comp).mean()) + float(sys.b_comp.item())
+end
+return sigmoid_scalar(logit)
+end
+
+export task infer_system(sys: InternalizedDiffusionSystem, x_obs: Tensor<f64, _, cpu>, force_full: bool = false): InferResult
+  let mc = sys.cfg.model
+  let pi_int = comp_gate_scalar(sys, x_obs)
+  let y_ext = expert_predict(sys.expert, x_obs)
+
+  if !force_full and pi_int < 0.05 then
+    return InferResult(output = y_ext, path_mode = "external_fast", backbone_nfe = 0, shortcuts_used = 0, pi_int = pi_int, g_int = 0.0)
+  end
+
+  let bias = struct_bias_from_wblk(sys.w_blk, sys.p_blk, sys.off_diag, sys.prefix_mask)
+  let z = no_grad
+  backbone_ode_step(sys.backbone, mc, x_obs, mc.num_steps, bias)
+end
+let nfe = 1
+let used_sc = 0
+let g_prod = 1.0
+let seg = 0
+let t_cur = mc.num_steps - 1
+
+while seg < 3
+  let gk = shortcut_gate_scalar(z, sys.wg_all[seg], float(sys.bg_all[seg]), mc.rms_eps)
+  assign g_prod = g_prod * gk
+  if !force_full and gk >= mc.theta_skip then
+    assign z = no_grad
+    shortcut_apply(z, sys.u_all[seg], sys.v_all[seg], mc.rms_eps)
+  end
+  assign used_sc = used_sc + 1
+  assign t_cur = t_cur - 2
+  let _done = 0
+else
+  assign z = no_grad
+  let z1 = backbone_ode_step(sys.backbone, mc, z, t_cur, bias)
+  backbone_ode_step(sys.backbone, mc, z1, t_cur - 1, bias)
+end
+assign nfe = nfe + 2
+assign t_cur = t_cur - 2
+let _done = 0
+end
+assign seg = seg + 1
+end
+
+let y_int = no_grad
+backbone_ode_step(sys.backbone, mc, z, 1, bias)
+end
+assign nfe = nfe + 1
+
+let g_mean = g_prod ** (1.0 / 3.0)
+let y_out = y_int * pi_int + y_ext * (1.0 - pi_int)
+let mode_str = if used_sc > 0 then "internal_shortened" else "internal_full" end
+return InferResult(output = y_out, path_mode = mode_str, backbone_nfe = nfe, shortcuts_used = used_sc, pi_int = pi_int, g_int = g_mean)
+end
+
+export task cad_bebc_generate_text(sys: InternalizedDiffusionSystem, codec: LatentCodec, prompt: string, prefix_len: int = 8, temperature: float = 0.0, top_k: int = 8, seed: int = 42): TextGenResult
+  let enc = encode_prefix_with_masked_suffix(codec, prompt, prefix_len, 0.2, seed)
+  let res = infer_system(sys, enc.z_in, false)
+  let text_out = decode_next_tokens_via_lm_head(codec, res.output, temperature, top_k)
+  return TextGenResult(text = text_out, path_mode = res.path_mode, backbone_nfe = res.backbone_nfe, shortcuts_used = res.shortcuts_used)
+end
+
+export task mean_gate_bias(sys: InternalizedDiffusionSystem): float
+  return float(sys.bg_all.mean())
+end
+
+export task mean_shortcut_v_rms(sys: InternalizedDiffusionSystem): float
+  return math.sqrt(float((sys.v_all * sys.v_all).mean()))
+end

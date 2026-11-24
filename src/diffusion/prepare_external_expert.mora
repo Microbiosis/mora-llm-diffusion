@@ -1,0 +1,62 @@
+-- Offline External Tool Script: Pre-builds and freezes the External Specialist SafeTensors model.
+
+import "std/net/http"
+import "std/nn/safetensors"
+import "src/diffusion/config.mora"
+import "src/diffusion/backbone.mora"
+import "src/diffusion/expert.mora"
+
+task specialist_loss(p_in: Tensor<f64, _, cpu>, an1: Tensor<f64, _, cpu>, wg1: Tensor<f64, _, cpu>, wu1: Tensor<f64, _, cpu>, wd1: Tensor<f64, _, cpu>, an2: Tensor<f64, _, cpu>, wg2: Tensor<f64, _, cpu>, wu2: Tensor<f64, _, cpu>, wd2: Tensor<f64, _, cpu>, p_out: Tensor<f64, _, cpu>, x_obs: Tensor<f64, _, cpu>, x_0: Tensor<f64, _, cpu>, rms_eps: float): float
+  let pred = expert_forward_raw(p_in, an1, wg1, wu1, wd1, an2, wg2, wu2, wd2, p_out, x_obs, rms_eps)
+  let diff = pred - x_0
+  return (diff * diff).mean()
+end
+
+task main()
+  let cfg = load_diffusion_config("config/diffusion.json")
+  let mc = cfg.model
+  let d = mc.d_model
+  let h = mc.ffn_hidden
+  let seed = 9001
+  random.seed(seed)
+
+  let sc = 0.1
+  let p_in = Tensor::randn([d, d], "f64", "cpu") * sc
+  let an1 = Tensor::ones([d], "f64", "cpu")
+  let wg1 = Tensor::randn([d, h], "f64", "cpu") * sc
+  let wu1 = Tensor::randn([d, h], "f64", "cpu") * sc
+  let wd1 = Tensor::randn([h, d], "f64", "cpu") * sc
+  let an2 = Tensor::ones([d], "f64", "cpu")
+  let wg2 = Tensor::randn([d, h], "f64", "cpu") * sc
+  let wu2 = Tensor::randn([d, h], "f64", "cpu") * sc
+  let wd2 = Tensor::randn([h, d], "f64", "cpu") * sc
+  let p_out = Tensor::randn([d, d], "f64", "cpu") * sc
+
+  let vg = value_and_grad(specialist_loss, argnums = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+  let lr = 0.05
+  let step = 1
+  let last_loss = 0.0
+  while step <= 220
+    let pair = sample_structured_batch(4, mc.num_blocks, mc.block_size, d, "simple", seed + step * 13)
+    let res = vg(p_in, an1, wg1, wu1, wd1, an2, wg2, wu2, wd2, p_out, pair[0], pair[1], mc.rms_eps)
+    assign last_loss = float(res[0])
+    let gs: list<Tensor<f64, _, cpu>> = res[1]
+    assign p_in = p_in - gs[0] * lr
+    assign an1 = an1 - gs[1] * lr
+    assign wg1 = wg1 - gs[2] * lr
+    assign wu1 = wu1 - gs[3] * lr
+    assign wd1 = wd1 - gs[4] * lr
+    assign an2 = an2 - gs[5] * lr
+    assign wg2 = wg2 - gs[6] * lr
+    assign wu2 = wu2 - gs[7] * lr
+    assign wd2 = wd2 - gs[8] * lr
+    assign p_out = p_out - gs[9] * lr
+    assign step = step + 1
+  end
+
+  let ee = cfg.external_expert
+  let exp = ExternalFastExpert(mode = "safetensors", http_addr = ee.http_addr, http_path = ee.http_path, model_name = ee.model_name, timeout_ms = ee.timeout_ms, has_weights = true, in_proj = p_in, an1 = an1, wg1 = wg1, wu1 = wu1, wd1 = wd1, an2 = an2, wg2 = wg2, wu2 = wu2, wd2 = wd2, out_proj = p_out, rms_eps = mc.rms_eps)
+  let nbytes = save_external_expert(ee.checkpoint_path, exp, d, h)
+  print("=== Built Frozen External Specialist ===")
+  print("path:", ee.checkpoint_path, "| params:", count_expert_parameters(exp), "| size(bytes):", nbytes, "| final_simple_mse:", last_loss)
+end

@@ -1,0 +1,103 @@
+-- Unit & numerical verification tests for RoPE, GQA, SwiGLU, causality, autograd, and optimizer.
+
+import "src/config.mora"
+import "src/data.mora"
+import "src/model.mora"
+import "src/optim.mora"
+
+export task test_const_generic_blocks()
+  random.seed(123)
+  let x = Tensor::randn([2, 6, 32], "f64", "cpu")
+  let mask = build_causal_mask(6)
+  let rope = build_rope_tables(6, 8, 10000.0)
+  let rot_j = build_rope_rot_matrix()
+
+  let block = build_default_block(Tensor::randn([32, 32], "f64", "cpu") * 0.1, Tensor::randn([32, 16], "f64", "cpu") * 0.1, Tensor::randn([32, 16], "f64", "cpu") * 0.1, Tensor::randn([32, 32], "f64", "cpu") * 0.1, Tensor::randn([32, 64], "f64", "cpu") * 0.1, Tensor::randn([32, 64], "f64", "cpu") * 0.1, Tensor::randn([64, 32], "f64", "cpu") * 0.1, Tensor::ones([32], "f64", "cpu"), Tensor::ones([32], "f64", "cpu"))
+
+  let y: Tensor<f64, [2, 6, 32], cpu> = block.forward(x, mask, rope[0], rope[1], rot_j, 0.00001)
+  assert_eq(y.shape(), [2, 6, 32])
+end
+
+export task test_rope_norm_preservation()
+  random.seed(7)
+  let x = Tensor::randn([1, 2, 8, 8], "f64", "cpu")
+  let rope = build_rope_tables(8, 8, 10000.0)
+  let rot_j = build_rope_rot_matrix()
+  let y = apply_rope(x, rope[0], rope[1], rot_j, 1, 2, 8, 8)
+  let n_before = (x * x).sum()
+  let n_after = (y * y).sum()
+  assert(math.abs(n_before - n_after) < 0.0000000001, "RoPE must preserve L2 norm")
+end
+
+export task test_causal_mask_invariance()
+  let cfg = ModelConfig(vocab_size = 16, seq_len = 6, n_layers = 2, d_model = 16, n_q_heads = 4, n_kv_heads = 2, head_dim = 4, ffn_hidden = 32, rms_eps = 0.00001, rope_theta = 10000.0, init_scale = 0.1)
+  let p = init_model_params(cfg, 99)
+  let eye = build_eye_rows(16)
+  let mask = build_causal_mask(6)
+  let rope = build_rope_tables(6, 4, 10000.0)
+  let rot_j = build_rope_rot_matrix()
+
+  let x1 = encode_ids_onehot([[1, 2, 3, 4, 5, 6]], eye)
+  let x2 = encode_ids_onehot([[1, 2, 3, 9, 10, 11]], eye)
+  let l1 = eval_logits(p, cfg, x1, mask, rope[0], rope[1], rot_j)
+  let l2 = eval_logits(p, cfg, x2, mask, rope[0], rope[1], rot_j)
+
+  -- Positions 0, 1, 2 must be identical despite differing tokens at positions >= 3
+  let diff = (l1[0][0..3] - l2[0][0..3]).abs().max()
+  assert(diff < 0.00000000001, "future tokens leaked into earlier causal positions")
+end
+
+export task test_autograd_finite_difference()
+  let cfg = ModelConfig(vocab_size = 12, seq_len = 4, n_layers = 2, d_model = 8, n_q_heads = 2, n_kv_heads = 1, head_dim = 4, ffn_hidden = 16, rms_eps = 0.00001, rope_theta = 10000.0, init_scale = 0.15)
+  let p = init_model_params(cfg, 42)
+  let eye = build_eye_rows(12)
+  let bx = encode_ids_onehot([[1, 2, 3, 4]], eye)
+  let by = encode_ids_onehot([[2, 3, 4, 5]], eye)
+  let mask = build_causal_mask(4)
+  let rope = build_rope_tables(4, 4, 10000.0)
+  let rot_j = build_rope_rot_matrix()
+
+  let vg = value_and_grad(loss_fn, argnums = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+  let res = vg(p.tok_emb, p.wq, p.wk, p.wv, p.wo, p.w_gate, p.w_up, p.w_down, p.attn_norm, p.ffn_norm, p.final_norm, p.lm_head, bx, by, mask, rope[0], rope[1], rot_j, cfg.n_layers, cfg.n_q_heads, cfg.n_kv_heads, cfg.head_dim, cfg.rms_eps)
+  let grads: list<Tensor<f64, _, cpu>> = res[1]
+  let ad = float(grads[2][0][0][0])
+
+  -- Perturb wk[0, 0, 0]
+  let wk_shape = p.wk.shape()
+  let n_wk = p.wk.numel()
+  let eps = 0.000001
+  let flat: list<float> = [eps]
+  let i = 1
+  while i < n_wk
+    assign flat = flat.push(0.0)
+    assign i = i + 1
+  end
+  let pert = Tensor::from_list(flat, "f64").reshape(wk_shape)
+  let lp = loss_fn(p.tok_emb, p.wq, p.wk + pert, p.wv, p.wo, p.w_gate, p.w_up, p.w_down, p.attn_norm, p.ffn_norm, p.final_norm, p.lm_head, bx, by, mask, rope[0], rope[1], rot_j, cfg.n_layers, cfg.n_q_heads, cfg.n_kv_heads, cfg.head_dim, cfg.rms_eps)
+  let lm = loss_fn(p.tok_emb, p.wq, p.wk - pert, p.wv, p.wo, p.w_gate, p.w_up, p.w_down, p.attn_norm, p.ffn_norm, p.final_norm, p.lm_head, bx, by, mask, rope[0], rope[1], rot_j, cfg.n_layers, cfg.n_q_heads, cfg.n_kv_heads, cfg.head_dim, cfg.rms_eps)
+  let fd = (lp - lm) / (2.0 * eps)
+  assert(math.abs(ad - fd) < 0.000001, "autograd vs finite difference mismatch for GQA wk")
+end
+
+export task test_cosine_lr_and_optimizer_step()
+  assert(math.abs(cosine_warmup_lr(5, 10, 100, 0.02, 0.002) - 0.01) < 0.000000000001)
+  assert(math.abs(cosine_warmup_lr(10, 10, 100, 0.02, 0.002) - 0.02) < 0.000000000001)
+  assert(math.abs(cosine_warmup_lr(100, 10, 100, 0.02, 0.002) - 0.002) < 0.000000000001)
+
+  let cfg = ModelConfig(vocab_size = 12, seq_len = 4, n_layers = 2, d_model = 8, n_q_heads = 2, n_kv_heads = 1, head_dim = 4, ffn_hidden = 16, rms_eps = 0.00001, rope_theta = 10000.0, init_scale = 0.1)
+  let p = init_model_params(cfg, 11)
+  let opt = init_adamw_state(p)
+  let eye = build_eye_rows(12)
+  let bx = encode_ids_onehot([[1, 2, 3, 4]], eye)
+  let by = encode_ids_onehot([[2, 3, 4, 5]], eye)
+  let mask = build_causal_mask(4)
+  let rope = build_rope_tables(4, 4, 10000.0)
+  let rot_j = build_rope_rot_matrix()
+
+  let vg = value_and_grad(loss_fn, argnums = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+  let r0 = vg(p.tok_emb, p.wq, p.wk, p.wv, p.wo, p.w_gate, p.w_up, p.w_down, p.attn_norm, p.ffn_norm, p.final_norm, p.lm_head, bx, by, mask, rope[0], rope[1], rot_j, cfg.n_layers, cfg.n_q_heads, cfg.n_kv_heads, cfg.head_dim, cfg.rms_eps)
+  let loss0 = float(r0[0])
+  let upd = adamw_update_all(p, opt, r0[1], 0.02, 0.9, 0.999, 0.00000001, 0.01, 1.0)
+  let loss1 = eval_batch_loss(upd.params, cfg, bx, by, mask, rope[0], rope[1], rot_j)
+  assert(loss1 < loss0, "AdamW step should decrease loss on fixed batch")
+end

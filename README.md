@@ -1,0 +1,89 @@
+# mora-llm-diffusion (CAD-BEBC)
+
+基于 **Mora v0.111.0** 语言工具链实现的 **CAD-BEBC（连续自回归扩散块外双向因果架构）** 统一系统：以连续潜空间块扩散为主干，整合**块内双向 + 块外可微双向因果 $W_{\text{blk}}$ + 前缀因果顺序**，融合反向传播梯度与死区软门（`m_ok / m_fail` + 静息偏置 `b_rest`），由权重自身缓慢演进自然涌现跨步低秩短通路、跳过门神经元及 OOD 高误差回退能力，并与外部冻结专家（Mini-LLaMA / HTTP 服务）无路由器协同。
+
+## 统一系统架构
+
+```text
+文本 / 连续输入
+  │
+  ▼
+LatentCodec（连续潜空间编码：src/latent_codec.mora）
+  │
+  ▼
+CAD-BEBC 统一调度与演化（src/cad_bebc.mora + src/diffusion/pipeline.mora）
+  ├─ 外部冻结专家快速通道 (pi_int < 0.2) ──► 冻结 Mini-LLaMA / HTTP 服务（0 扩散步直出）
+  ├─ 内化短通路 (g_k >= 0.85)             ──► 跨步低秩映射（跳过中间主干步，NFE 8 -> 2）
+  └─ 连续块扩散主干                       ──► 多步流匹配去噪（块内双向 + 块外 W_blk + 前缀因果）
+  │
+  ▼
+LatentCodec 解码输出 / 误差门控权重演进（m_ok / m_fail + b_rest + 反传 W_blk）
+```
+
+## 目录结构
+
+```text
+.
+├── archive/
+│   └── trainable_llm.mora          # 早期单文件微型原型（历史归档）
+├── config/
+│   ├── default.json                # 外部 Mini-LLaMA 预训练与分词器配置
+│   ├── diffusion.json              # CAD-BEBC 默认配置（2 层 D=32、prefix_blocks=2、mode=llama）
+│   └── diffusion_scale.json        # CAD-BEBC 扩展配置档位（4 层 D=64、12 步、mode=http）
+├── data/
+│   └── corpus.txt                  # 文本语料（用于 Mini-LLaMA 预训练与 CAD-BEBC 连续潜空间评估）
+├── docs/
+│   └── cad_bebc_architecture.md    # CAD-BEBC 统一架构规范与边界说明
+├── models/
+│   ├── mini_llama_frozen.safetensors  # 冻结的 Mini-LLaMA 外部专家与潜空间编解码权重（25,056 参数）
+│   └── external_expert.safetensors    # 备用离线冻结 SwiGLU 外部专家权重（14,400 参数）
+├── checkpoints/                    # 训练输出目录（按 .gitignore 忽略权重缓存）
+├── src/
+│   ├── cad_bebc.mora               # 【统一主入口】CAD-BEBC 全流程演化、文本/潜空间统一推理与 OOD 适应
+│   ├── latent_codec.mora           # 离散文本 <-> 连续潜空间块编解码器
+│   ├── diffusion/
+│   │   ├── config.mora             # CAD-BEBC 超参数与外部专家配置加载
+│   │   ├── backbone.mora           # 2 层连续块扩散主干（Pre-RMSNorm + 结构偏置注意力 + SwiGLU）
+│   │   ├── causal_graph.mora       # 块内双向 + 前缀因果掩码 + 误差门控反传块间因果权重 W_blk
+│   │   ├── shortcut.mora           # 死区软门 m_ok/m_fail、影子对齐损失与门控神经元 (w_g, b_g)
+│   │   ├── expert.mora             # 外部冻结专家统一适配器（支持 llama / http / safetensors）
+│   │   ├── external_service.mora   # 基于 std/net/http 的独立外部模型 HTTP 服务 (/v1/predict, /health)
+│   │   ├── prepare_external_expert.mora  # 离线生成备用 SafeTensors 专家权重工具
+│   │   └── pipeline.mora           # 融合反传梯度与死区慢可塑性 (emerge_step)、真跳步推理与文本管线
+│   ├── config.mora                 # Mini-LLaMA 配置加载（供外部专家预训练与 LatentCodec 共用）
+│   ├── tokenizer.mora              # 纯 Mora UTF-8 字节级分词器（Vocab = 101）
+│   ├── data.mora                   # 语料切分、多批次采样、因果掩码与 RoPE 表
+│   ├── model.mora                  # Mini-LLaMA 模型定义（RoPE + GQA + SwiGLU + 潜空间隐状态接口）
+│   ├── optim.mora                  # Cosine Warmup 调度与 AdamW
+│   ├── checkpoint.mora             # std/nn/safetensors 磁盘权重读写
+│   ├── sampler.mora                # Top-K / Temperature 采样解码
+│   ├── train.mora                  # 外部 Mini-LLaMA 专家离线预训练脚本
+│   └── generate.mora               # 外部 Mini-LLaMA 独立对比基线生成脚本
+└── tests/
+    ├── tokenizer_test.mora         # 分词器单元测试
+    ├── model_test.mora             # RoPE/GQA/因果掩码/有限差分梯度单元测试
+    ├── checkpoint_test.mora        # SafeTensors 磁盘一致性测试
+    └── diffusion_test.mora         # CAD-BEBC 三层注意力、实时 HTTP 外部服务、统一文本管线与梯度涌现测试
+```
+
+## 常用命令
+
+请在项目根目录运行：
+
+```bash
+# 1. 运行 CAD-BEBC 统一系统主入口（潜空间编码 -> 冻结 Mini-LLaMA 快路径 -> 梯度涌现 -> 短通路推理 -> 文本解码）
+mora src/cad_bebc.mora
+
+# 2. 静态类型检查与代码格式校验
+mora --check src/cad_bebc.mora
+mora fmt --check src tests
+
+# 3. 运行全量并发单元测试套件
+mora test
+
+# 4. 可选：启动独立外部 HTTP 模型服务（供 external_expert.mode="http" 对接）
+mora src/diffusion/external_service.mora
+
+# 5. 可选：重新训练外部 Mini-LLaMA 专家权重
+mora src/train.mora
+```

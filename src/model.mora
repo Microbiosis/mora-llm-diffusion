@@ -1,0 +1,214 @@
+-- Upgraded LLaMA-style Decoder-Only Transformer Architecture in Mora v0.111.0
+-- Features:
+--   1. Pre-RMSNorm residual connections
+--   2. Rotary Position Embeddings (RoPE) via differentiable pair rotation
+--   3. Grouped-Query Attention (GQA) via 5D head-group broadcasting
+--   4. SwiGLU Feed-Forward Network
+--   5. Multi-layer stacked parameters ([L, ...]) with differentiable Gather indexing
+--   6. Compile-time Const-Generic typed layers + config-driven multi-layer loss/eval
+
+import "src/config.mora"
+
+-- =============================================================================
+-- 1. Differentiable RoPE Operator
+-- =============================================================================
+
+export task apply_rope(x: Tensor<f64, _, cpu>, cos_tab: Tensor<f64, _, cpu>, sin_tab: Tensor<f64, _, cpu>, rot_j: Tensor<f64, [2, 2], cpu>, b: int, h: int, t: int, hd: int): Tensor<f64, _, cpu>
+  let half = hd / 2
+  let x_rot = (x.reshape([b, h, t, half, 2]) @ rot_j).reshape([b, h, t, hd])
+  return x * cos_tab + x_rot * sin_tab
+end
+
+-- =============================================================================
+-- 2. Const-Generic Neural Network Building Blocks (Static Shape Verification)
+-- =============================================================================
+
+export struct Linear < const IN: int, const OUT: int >
+  weight: Tensor<f64, [IN, OUT], cpu>
+end
+
+impl < const IN: int, const OUT: int > Linear < IN, OUT >
+  task forward < B, T > (self, x: Tensor<f64, [B, T, IN], cpu>): Tensor<f64, [B, T, OUT], cpu>
+    return x @ self.weight
+  end
+end
+
+export struct RmsNorm < const D: int >
+  gamma: Tensor<f64, [D], cpu>
+end
+
+impl < const D: int > RmsNorm < D >
+  task forward < B, T > (self, x: Tensor<f64, [B, T, D], cpu>, eps: float = 0.00001): Tensor<f64, [B, T, D], cpu>
+    return x.rms_norm(eps) * self.gamma
+  end
+end
+
+export struct SwiGLU < const D: int, const H: int >
+  w_gate: Tensor<f64, [D, H], cpu>
+  w_up: Tensor<f64, [D, H], cpu>
+  w_down: Tensor<f64, [H, D], cpu>
+end
+
+impl < const D: int, const H: int > SwiGLU < D, H >
+  task forward < B, T > (self, x: Tensor<f64, [B, T, D], cpu>): Tensor<f64, [B, T, D], cpu>
+    let gate = (x @ self.w_gate).silu()
+    let up = x @ self.w_up
+    return (gate * up) @ self.w_down
+  end
+end
+
+export struct GroupedQueryAttention < const D: int, const HQ: int, const HKV: int, const HD: int, const QDIM: int, const KVDIM: int >
+  wq: Tensor<f64, [D, QDIM], cpu>
+  wk: Tensor<f64, [D, KVDIM], cpu>
+  wv: Tensor<f64, [D, KVDIM], cpu>
+  wo: Tensor<f64, [QDIM, D], cpu>
+end
+
+impl < const D: int, const HQ: int, const HKV: int, const HD: int, const QDIM: int, const KVDIM: int > GroupedQueryAttention < D, HQ, HKV, HD, QDIM, KVDIM >
+  task forward < B, T > (self, x: Tensor<f64, [B, T, D], cpu>, causal_mask: Tensor<f64, [T, T], cpu>, rope_cos: Tensor<f64, [1, 1, T, HD], cpu>, rope_sin: Tensor<f64, [1, 1, T, HD], cpu>, rot_j: Tensor<f64, [2, 2], cpu>): Tensor<f64, [B, T, D], cpu>
+    let shp = x.shape()
+    let bsz = shp[0]
+    let seq = shp[1]
+    let g_size = HQ / HKV
+
+    let q = (x @ self.wq).reshape([bsz, seq, HQ, HD]).transpose(1, 2)
+    let k = (x @ self.wk).reshape([bsz, seq, HKV, HD]).transpose(1, 2)
+    let v = (x @ self.wv).reshape([bsz, seq, HKV, HD]).transpose(1, 2)
+
+    let q_rot = apply_rope(q, rope_cos, rope_sin, rot_j, bsz, HQ, seq, HD)
+    let k_rot = apply_rope(k, rope_cos, rope_sin, rot_j, bsz, HKV, seq, HD)
+
+    let q_g = q_rot.reshape([bsz, HKV, g_size, seq, HD])
+    let k_g = k_rot.reshape([bsz, HKV, 1, seq, HD])
+    let v_g = v.reshape([bsz, HKV, 1, seq, HD])
+
+    let scale = 1.0 / math.sqrt(float(HD))
+    let scores = (q_g @ k_g.transpose(-2, -1)) * scale + causal_mask
+    let attn_w = scores.softmax()
+    let ctx = (attn_w @ v_g).reshape([bsz, HQ, seq, HD]).transpose(1, 2).reshape([bsz, seq, QDIM])
+    return ctx @ self.wo
+  end
+end
+
+export struct TransformerBlock < const D: int, const HQ: int, const HKV: int, const HD: int, const QDIM: int, const KVDIM: int, const HFFN: int >
+  attn_norm: RmsNorm < D >
+  attn: GroupedQueryAttention < D, HQ, HKV, HD, QDIM, KVDIM >
+  ffn_norm: RmsNorm < D >
+  ffn: SwiGLU < D, HFFN >
+end
+
+impl < const D: int, const HQ: int, const HKV: int, const HD: int, const QDIM: int, const KVDIM: int, const HFFN: int > TransformerBlock < D, HQ, HKV, HD, QDIM, KVDIM, HFFN >
+  task forward < B, T > (self, x: Tensor<f64, [B, T, D], cpu>, causal_mask: Tensor<f64, [T, T], cpu>, rope_cos: Tensor<f64, [1, 1, T, HD], cpu>, rope_sin: Tensor<f64, [1, 1, T, HD], cpu>, rot_j: Tensor<f64, [2, 2], cpu>, rms_eps: float = 0.00001): Tensor<f64, [B, T, D], cpu>
+    let h = x + self.attn.forward(self.attn_norm.forward(x, rms_eps), causal_mask, rope_cos, rope_sin, rot_j)
+    return h + self.ffn.forward(self.ffn_norm.forward(h, rms_eps))
+  end
+end
+
+-- =============================================================================
+-- 3. Multi-Layer Stacked Parameter Bundle & Functional Forward / Loss
+-- =============================================================================
+
+export struct MiniLLaMAParams
+  tok_emb: Tensor<f64, _, cpu>
+  wq: Tensor<f64, _, cpu>
+  wk: Tensor<f64, _, cpu>
+  wv: Tensor<f64, _, cpu>
+  wo: Tensor<f64, _, cpu>
+  w_gate: Tensor<f64, _, cpu>
+  w_up: Tensor<f64, _, cpu>
+  w_down: Tensor<f64, _, cpu>
+  attn_norm: Tensor<f64, _, cpu>
+  ffn_norm: Tensor<f64, _, cpu>
+  final_norm: Tensor<f64, _, cpu>
+  lm_head: Tensor<f64, _, cpu>
+end
+
+export task init_model_params(cfg: ModelConfig, seed: int = 20261123): MiniLLaMAParams
+  random.seed(seed)
+  let s = cfg.init_scale
+  let l = cfg.n_layers
+  let v = cfg.vocab_size
+  let d = cfg.d_model
+  let q_dim = cfg.n_q_heads * cfg.head_dim
+  let kv_dim = cfg.n_kv_heads * cfg.head_dim
+  let h = cfg.ffn_hidden
+  let res_scale = s / math.sqrt(float(2 * l))
+
+  return MiniLLaMAParams(tok_emb = Tensor::randn([v, d], "f64", "cpu") * s, wq = Tensor::randn([l, d, q_dim], "f64", "cpu") * s, wk = Tensor::randn([l, d, kv_dim], "f64", "cpu") * s, wv = Tensor::randn([l, d, kv_dim], "f64", "cpu") * s, wo = Tensor::randn([l, q_dim, d], "f64", "cpu") * res_scale, w_gate = Tensor::randn([l, d, h], "f64", "cpu") * s, w_up = Tensor::randn([l, d, h], "f64", "cpu") * s, w_down = Tensor::randn([l, h, d], "f64", "cpu") * res_scale, attn_norm = Tensor::ones([l, d], "f64", "cpu"), ffn_norm = Tensor::ones([l, d], "f64", "cpu"), final_norm = Tensor::ones([d], "f64", "cpu"), lm_head = Tensor::randn([d, v], "f64", "cpu") * s)
+end
+
+export task count_parameters(p: MiniLLaMAParams): int
+  return p.tok_emb.numel() + p.wq.numel() + p.wk.numel() + p.wv.numel() + p.wo.numel() + p.w_gate.numel() + p.w_up.numel() + p.w_down.numel() + p.attn_norm.numel() + p.ffn_norm.numel() + p.final_norm.numel() + p.lm_head.numel()
+end
+
+export task forward_hidden_from_latent(p_wq: Tensor<f64, _, cpu>, p_wk: Tensor<f64, _, cpu>, p_wv: Tensor<f64, _, cpu>, p_wo: Tensor<f64, _, cpu>, p_wg: Tensor<f64, _, cpu>, p_wu: Tensor<f64, _, cpu>, p_wd: Tensor<f64, _, cpu>, p_an: Tensor<f64, _, cpu>, p_fn: Tensor<f64, _, cpu>, p_fnorm: Tensor<f64, _, cpu>, h_in: Tensor<f64, _, cpu>, bmask: Tensor<f64, _, cpu>, rcos: Tensor<f64, _, cpu>, rsin: Tensor<f64, _, cpu>, rot_j: Tensor<f64, [2, 2], cpu>, n_layers: int, n_q_heads: int, n_kv_heads: int, head_dim: int, rms_eps: float): Tensor<f64, _, cpu>
+  let shp = h_in.shape()
+  let bsz = shp[0]
+  let seq = shp[1]
+  let g_size = n_q_heads / n_kv_heads
+  let q_dim = n_q_heads * head_dim
+  let scale = 1.0 / math.sqrt(float(head_dim))
+
+  let h = h_in
+  let l = 0
+  while l < n_layers
+    let hn = h.rms_norm(rms_eps) * p_an[l]
+    let q = (hn @ p_wq[l]).reshape([bsz, seq, n_q_heads, head_dim]).transpose(1, 2)
+    let k = (hn @ p_wk[l]).reshape([bsz, seq, n_kv_heads, head_dim]).transpose(1, 2)
+    let v = (hn @ p_wv[l]).reshape([bsz, seq, n_kv_heads, head_dim]).transpose(1, 2)
+
+    let q_rot = apply_rope(q, rcos, rsin, rot_j, bsz, n_q_heads, seq, head_dim)
+    let k_rot = apply_rope(k, rcos, rsin, rot_j, bsz, n_kv_heads, seq, head_dim)
+
+    let q_g = q_rot.reshape([bsz, n_kv_heads, g_size, seq, head_dim])
+    let k_g = k_rot.reshape([bsz, n_kv_heads, 1, seq, head_dim])
+    let v_g = v.reshape([bsz, n_kv_heads, 1, seq, head_dim])
+
+    let scores = (q_g @ k_g.transpose(-2, -1)) * scale + bmask
+    let attn_w = scores.softmax()
+    let ctx = (attn_w @ v_g).reshape([bsz, n_q_heads, seq, head_dim]).transpose(1, 2).reshape([bsz, seq, q_dim])
+    assign h = h + (ctx @ p_wo[l])
+
+    let fn_in = h.rms_norm(rms_eps) * p_fn[l]
+    let gate = (fn_in @ p_wg[l]).silu()
+    let up = fn_in @ p_wu[l]
+    assign h = h + ((gate * up) @ p_wd[l])
+
+    assign l = l + 1
+  end
+
+  return h.rms_norm(rms_eps) * p_fnorm
+end
+
+export task decode_latent_to_logits(p: MiniLLaMAParams, z: Tensor<f64, _, cpu>, rms_eps: float = 0.00001): Tensor<f64, _, cpu>
+  return no_grad
+  (z.rms_norm(rms_eps) * p.final_norm) @ p.lm_head
+end
+end
+
+export task forward_logits(p_tok: Tensor<f64, _, cpu>, p_wq: Tensor<f64, _, cpu>, p_wk: Tensor<f64, _, cpu>, p_wv: Tensor<f64, _, cpu>, p_wo: Tensor<f64, _, cpu>, p_wg: Tensor<f64, _, cpu>, p_wu: Tensor<f64, _, cpu>, p_wd: Tensor<f64, _, cpu>, p_an: Tensor<f64, _, cpu>, p_fn: Tensor<f64, _, cpu>, p_fnorm: Tensor<f64, _, cpu>, p_lm: Tensor<f64, _, cpu>, bx: Tensor<f64, _, cpu>, bmask: Tensor<f64, _, cpu>, rcos: Tensor<f64, _, cpu>, rsin: Tensor<f64, _, cpu>, rot_j: Tensor<f64, [2, 2], cpu>, n_layers: int, n_q_heads: int, n_kv_heads: int, head_dim: int, rms_eps: float): Tensor<f64, _, cpu>
+  let h_in = bx @ p_tok
+  let h_final = forward_hidden_from_latent(p_wq, p_wk, p_wv, p_wo, p_wg, p_wu, p_wd, p_an, p_fn, p_fnorm, h_in, bmask, rcos, rsin, rot_j, n_layers, n_q_heads, n_kv_heads, head_dim, rms_eps)
+  return h_final @ p_lm
+end
+
+export task loss_fn(p_tok: Tensor<f64, _, cpu>, p_wq: Tensor<f64, _, cpu>, p_wk: Tensor<f64, _, cpu>, p_wv: Tensor<f64, _, cpu>, p_wo: Tensor<f64, _, cpu>, p_wg: Tensor<f64, _, cpu>, p_wu: Tensor<f64, _, cpu>, p_wd: Tensor<f64, _, cpu>, p_an: Tensor<f64, _, cpu>, p_fn: Tensor<f64, _, cpu>, p_fnorm: Tensor<f64, _, cpu>, p_lm: Tensor<f64, _, cpu>, bx: Tensor<f64, _, cpu>, by: Tensor<f64, _, cpu>, bmask: Tensor<f64, _, cpu>, rcos: Tensor<f64, _, cpu>, rsin: Tensor<f64, _, cpu>, rot_j: Tensor<f64, [2, 2], cpu>, n_layers: int, n_q_heads: int, n_kv_heads: int, head_dim: int, rms_eps: float): float
+  let shp = bx.shape()
+  let bsz = shp[0]
+  let seq = shp[1]
+  let logits = forward_logits(p_tok, p_wq, p_wk, p_wv, p_wo, p_wg, p_wu, p_wd, p_an, p_fn, p_fnorm, p_lm, bx, bmask, rcos, rsin, rot_j, n_layers, n_q_heads, n_kv_heads, head_dim, rms_eps)
+  let probs = logits.softmax()
+  return -(by * (probs + 0.000000001).ln()).sum() / float(bsz * seq)
+end
+
+export task eval_batch_loss(p: MiniLLaMAParams, cfg: ModelConfig, bx: Tensor<f64, _, cpu>, by: Tensor<f64, _, cpu>, bmask: Tensor<f64, _, cpu>, rcos: Tensor<f64, _, cpu>, rsin: Tensor<f64, _, cpu>, rot_j: Tensor<f64, [2, 2], cpu>): float
+  return no_grad
+  loss_fn(p.tok_emb, p.wq, p.wk, p.wv, p.wo, p.w_gate, p.w_up, p.w_down, p.attn_norm, p.ffn_norm, p.final_norm, p.lm_head, bx, by, bmask, rcos, rsin, rot_j, cfg.n_layers, cfg.n_q_heads, cfg.n_kv_heads, cfg.head_dim, cfg.rms_eps)
+end
+end
+
+export task eval_logits(p: MiniLLaMAParams, cfg: ModelConfig, bx: Tensor<f64, _, cpu>, bmask: Tensor<f64, _, cpu>, rcos: Tensor<f64, _, cpu>, rsin: Tensor<f64, _, cpu>, rot_j: Tensor<f64, [2, 2], cpu>): Tensor<f64, _, cpu>
+  return no_grad
+  forward_logits(p.tok_emb, p.wq, p.wk, p.wv, p.wo, p.w_gate, p.w_up, p.w_down, p.attn_norm, p.ffn_norm, p.final_norm, p.lm_head, bx, bmask, rcos, rsin, rot_j, cfg.n_layers, cfg.n_q_heads, cfg.n_kv_heads, cfg.head_dim, cfg.rms_eps)
+end
+end

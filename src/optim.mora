@@ -1,0 +1,94 @@
+-- Optimization utilities: Cosine Warmup LR Scheduler, Global Gradient Norm Clipping, and AdamW.
+
+import "src/model.mora"
+
+export struct AdamWState
+  step: int = 0
+  beta1_pow: float = 1.0
+  beta2_pow: float = 1.0
+  m: list<Tensor<f64, _, cpu>>
+  v: list<Tensor<f64, _, cpu>>
+end
+
+export struct OptimStepResult
+  params: MiniLLaMAParams
+  state: AdamWState
+  grad_norm: float = 0.0
+end
+
+export task init_adamw_state(p: MiniLLaMAParams): AdamWState
+  let m_list: list<Tensor<f64, _, cpu>> = [Tensor::zeros(p.tok_emb.shape(), "f64", "cpu"), Tensor::zeros(p.wq.shape(), "f64", "cpu"), Tensor::zeros(p.wk.shape(), "f64", "cpu"), Tensor::zeros(p.wv.shape(), "f64", "cpu"), Tensor::zeros(p.wo.shape(), "f64", "cpu"), Tensor::zeros(p.w_gate.shape(), "f64", "cpu"), Tensor::zeros(p.w_up.shape(), "f64", "cpu"), Tensor::zeros(p.w_down.shape(), "f64", "cpu"), Tensor::zeros(p.attn_norm.shape(), "f64", "cpu"), Tensor::zeros(p.ffn_norm.shape(), "f64", "cpu"), Tensor::zeros(p.final_norm.shape(), "f64", "cpu"), Tensor::zeros(p.lm_head.shape(), "f64", "cpu")]
+  let v_list: list<Tensor<f64, _, cpu>> = [Tensor::zeros(p.tok_emb.shape(), "f64", "cpu"), Tensor::zeros(p.wq.shape(), "f64", "cpu"), Tensor::zeros(p.wk.shape(), "f64", "cpu"), Tensor::zeros(p.wv.shape(), "f64", "cpu"), Tensor::zeros(p.wo.shape(), "f64", "cpu"), Tensor::zeros(p.w_gate.shape(), "f64", "cpu"), Tensor::zeros(p.w_up.shape(), "f64", "cpu"), Tensor::zeros(p.w_down.shape(), "f64", "cpu"), Tensor::zeros(p.attn_norm.shape(), "f64", "cpu"), Tensor::zeros(p.ffn_norm.shape(), "f64", "cpu"), Tensor::zeros(p.final_norm.shape(), "f64", "cpu"), Tensor::zeros(p.lm_head.shape(), "f64", "cpu")]
+  return AdamWState(step = 0, beta1_pow = 1.0, beta2_pow = 1.0, m = m_list, v = v_list)
+end
+
+export task cosine_warmup_lr(step: int, warmup_steps: int, total_steps: int, max_lr: float, min_lr: float): float
+  if warmup_steps > 0 and step <= warmup_steps then
+    return max_lr * (float(step) / float(warmup_steps))
+  end
+  if total_steps <= warmup_steps then
+    return max_lr
+  end
+  let progress = float(step - warmup_steps) / float(total_steps - warmup_steps)
+  if progress < 0.0 then
+    assign progress = 0.0
+  end
+  if progress > 1.0 then
+    assign progress = 1.0
+  end
+  let pi = 3.141592653589793
+  let cosine = 0.5 * (1.0 + math.cos(pi * progress))
+  return min_lr + (max_lr - min_lr) * cosine
+end
+
+export task global_grad_norm(grads: list<Tensor<f64, _, cpu>>): float
+  let sq_sum = 0.0
+  for g in grads
+    assign sq_sum = sq_sum + (g * g).sum()
+  end
+  return math.sqrt(sq_sum)
+end
+
+export task adamw_tensor_step(p: Tensor<f64, _, cpu>, g: Tensor<f64, _, cpu>, m: Tensor<f64, _, cpu>, v: Tensor<f64, _, cpu>, lr: float, beta1: float, beta2: float, eps: float, wd: float, bc1: float, bc2: float): list<Tensor<f64, _, cpu>>
+  let m_new = m * beta1 + g * (1.0 - beta1)
+  let v_new = v * beta2 + (g * g) * (1.0 - beta2)
+  let m_hat = m_new / bc1
+  let v_hat = v_new / bc2
+  let p_new = p * (1.0 - lr * wd) - (m_hat / (v_hat.sqrt() + eps)) * lr
+  return [p_new, m_new, v_new]
+end
+
+export task adamw_update_all(p: MiniLLaMAParams, st: AdamWState, grads: list<Tensor<f64, _, cpu>>, lr: float, beta1: float, beta2: float, eps: float, wd: float, max_grad_norm: float): OptimStepResult
+  let gnorm = global_grad_norm(grads)
+  let clip_scale = 1.0
+  if max_grad_norm > 0.0 and gnorm > max_grad_norm then
+    assign clip_scale = max_grad_norm / (gnorm + 0.000001)
+  end
+
+  let b1p = st.beta1_pow * beta1
+  let b2p = st.beta2_pow * beta2
+  let bc1 = 1.0 - b1p
+  let bc2 = 1.0 - b2p
+
+  let p_list: list<Tensor<f64, _, cpu>> = [p.tok_emb, p.wq, p.wk, p.wv, p.wo, p.w_gate, p.w_up, p.w_down, p.attn_norm, p.ffn_norm, p.final_norm, p.lm_head]
+  -- Decoupled weight decay disabled for 1D/norm/embedding parameters (indices 0, 8, 9, 10)
+  let wds: list<float> = [0.0, wd, wd, wd, wd, wd, wd, wd, 0.0, 0.0, 0.0, wd]
+
+  let next_p: list<Tensor<f64, _, cpu>> = []
+  let next_m: list<Tensor<f64, _, cpu>> = []
+  let next_v: list<Tensor<f64, _, cpu>> = []
+
+  let i = 0
+  while i < 12
+    let gi = grads[i] * clip_scale
+    let res = adamw_tensor_step(p_list[i], gi, st.m[i], st.v[i], lr, beta1, beta2, eps, wds[i], bc1, bc2)
+    assign next_p = next_p.push(res[0])
+    assign next_m = next_m.push(res[1])
+    assign next_v = next_v.push(res[2])
+    assign i = i + 1
+  end
+
+  let new_params = MiniLLaMAParams(tok_emb = next_p[0], wq = next_p[1], wk = next_p[2], wv = next_p[3], wo = next_p[4], w_gate = next_p[5], w_up = next_p[6], w_down = next_p[7], attn_norm = next_p[8], ffn_norm = next_p[9], final_norm = next_p[10], lm_head = next_p[11])
+  let new_state = AdamWState(step = st.step + 1, beta1_pow = b1p, beta2_pow = b2p, m = next_m, v = next_v)
+  return OptimStepResult(params = new_params, state = new_state, grad_norm = gnorm)
+end

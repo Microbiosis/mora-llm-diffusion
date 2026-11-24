@@ -1,0 +1,39 @@
+-- Standalone Autoregressive Inference Script loading SafeTensors from disk.
+
+import "std/nn/safetensors"
+import "src/config.mora"
+import "src/tokenizer.mora"
+import "src/data.mora"
+import "src/model.mora"
+import "src/checkpoint.mora"
+import "src/sampler.mora"
+
+task main()
+  let app = load_config("config/default.json")
+  let mcfg = app.model
+  let gcfg = app.generate
+
+  assert(file.exists(gcfg.checkpoint_path), "checkpoint not found; run `mora src/train.mora` first: " + gcfg.checkpoint_path)
+
+  let tok = create_tokenizer()
+  let eye_rows = build_eye_rows(tok.vocab_size)
+  let causal_mask = build_causal_mask(mcfg.seq_len)
+  let rope = build_rope_tables(mcfg.seq_len, mcfg.head_dim, mcfg.rope_theta)
+  let rope_cos = rope[0]
+  let rope_sin = rope[1]
+  let rot_j = build_rope_rot_matrix()
+
+  let ckpt = load_checkpoint(gcfg.checkpoint_path, mcfg.n_layers, "cpu")
+  print("=== Loaded SafeTensors Checkpoint ===")
+  print("path:", gcfg.checkpoint_path, "| step:", ckpt.step, "| val_loss:", ckpt.val_loss, "| params:", count_parameters(ckpt.params))
+
+  let idx = 0
+  for prompt in gcfg.prompts
+    let out = generate_text(ckpt.params, mcfg, tok, eye_rows, causal_mask, rope_cos, rope_sin, rot_j, prompt, gcfg.max_new_tokens, gcfg.temperature, gcfg.top_k, gcfg.seed + idx)
+    print("")
+    print("--- Sample", idx + 1, "---")
+    print("Prompt:", prompt)
+    print("Generated:", out)
+    assign idx = idx + 1
+  end
+end

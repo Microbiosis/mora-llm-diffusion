@@ -1,0 +1,40 @@
+-- SafeTensors disk checkpoint save/inspect/load bit-exact round-trip test.
+
+import "std/nn/safetensors"
+import "src/config.mora"
+import "src/model.mora"
+import "src/checkpoint.mora"
+
+export task test_safetensors_disk_roundtrip()
+  let cfg = ModelConfig(vocab_size = 16, seq_len = 4, n_layers = 2, d_model = 16, n_q_heads = 4, n_kv_heads = 2, head_dim = 4, ffn_hidden = 32, rms_eps = 0.00001, rope_theta = 10000.0, init_scale = 0.1)
+  let p = init_model_params(cfg, 777)
+  let ckpt_path = "checkpoints/test_roundtrip.safetensors"
+
+  let nbytes = save_checkpoint(ckpt_path, p, cfg, 42, 1.25, 1.5)
+  assert(nbytes > 0, "save_checkpoint must write > 0 bytes")
+
+  let hdr = inspect_checkpoint(ckpt_path)
+  assert_eq(hdr.tensors.len(), 21)
+  assert_eq(hdr.metadata.get("step"), "42")
+
+  let loaded = load_checkpoint(ckpt_path, cfg.n_layers, "cpu")
+  assert_eq(loaded.step, 42)
+  assert(math.abs(loaded.val_loss - 1.5) < 0.000000001)
+
+  assert(loaded.params.tok_emb.to_bytes() == p.tok_emb.to_bytes())
+  assert(loaded.params.wq.to_bytes() == p.wq.to_bytes())
+  assert(loaded.params.wk.to_bytes() == p.wk.to_bytes())
+  assert(loaded.params.wv.to_bytes() == p.wv.to_bytes())
+  assert(loaded.params.wo.to_bytes() == p.wo.to_bytes())
+  assert(loaded.params.w_gate.to_bytes() == p.w_gate.to_bytes())
+  assert(loaded.params.w_up.to_bytes() == p.w_up.to_bytes())
+  assert(loaded.params.w_down.to_bytes() == p.w_down.to_bytes())
+  assert(loaded.params.attn_norm.to_bytes() == p.attn_norm.to_bytes())
+  assert(loaded.params.ffn_norm.to_bytes() == p.ffn_norm.to_bytes())
+  assert(loaded.params.final_norm.to_bytes() == p.final_norm.to_bytes())
+  assert(loaded.params.lm_head.to_bytes() == p.lm_head.to_bytes())
+
+  if file.exists(ckpt_path) then
+    file.remove(ckpt_path)
+  end
+end

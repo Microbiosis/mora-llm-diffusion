@@ -1,0 +1,7 @@
+# Runtime & build artifacts
+checkpoints/*.safetensors
+checkpoints/metrics.json
+*.morac
+*.exe
+vendor/
+.DS_Store

@@ -1,0 +1,56 @@
+{
+  "architecture": "cad-bebc-unified-v2",
+  "external_expert": {
+    "mode": "llama",
+    "http_addr": "127.0.0.1:18080",
+    "http_path": "/v1/predict",
+    "model_name": "mini-llama-frozen-v1",
+    "timeout_ms": 3000,
+    "checkpoint_path": "models/external_expert.safetensors",
+    "llama_checkpoint_path": "models/mini_llama_frozen.safetensors"
+  },
+  "model": {
+    "n_layers": 2,
+    "num_blocks": 4,
+    "block_size": 4,
+    "prefix_blocks": 2,
+    "d_model": 32,
+    "n_heads": 4,
+    "head_dim": 8,
+    "ffn_hidden": 64,
+    "rms_eps": 1e-5,
+    "num_steps": 8,
+    "shortcut_rank": 8,
+    "init_iso": 6.0,
+    "b_rest": -5.5,
+    "b_max": 3.0,
+    "init_comp_bias": -2.5,
+    "theta_skip": 0.75
+  },
+  "plasticity": {
+    "eps_low": 0.08,
+    "eps_high": 0.18,
+    "temp_e": 0.010,
+    "eps_shortcut": 0.10,
+    "temp_s": 0.012,
+    "eta_lr": 0.22,
+    "lambda_decay": 0.40,
+    "eta_g": 0.012,
+    "lambda_g": 0.20,
+    "eta_b": 0.25,
+    "lambda_b": 0.90,
+    "eta_conn": 0.04,
+    "lambda_conn": 7.0,
+    "eta_comp": 0.15,
+    "lambda_ext_bias": 0.001
+  },
+  "schedule": {
+    "pretrain_steps": 140,
+    "pretrain_lr": 0.03,
+    "cold_start_steps": 15,
+    "consolidation_steps": 720,
+    "mature_eval_steps": 30,
+    "ood_adapt_steps": 100,
+    "seed": 20261123
+  }
+}

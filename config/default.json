@@ -1,0 +1,54 @@
+{
+  "project": "mora-mini-llama",
+  "version": "1.0.0",
+  "model": {
+    "architecture": "mini-llama-rope-gqa-swiglu",
+    "vocab_size": 101,
+    "seq_len": 16,
+    "n_layers": 2,
+    "d_model": 32,
+    "n_q_heads": 4,
+    "n_kv_heads": 2,
+    "head_dim": 8,
+    "ffn_hidden": 64,
+    "rms_eps": 1e-5,
+    "rope_theta": 10000.0,
+    "init_scale": 0.12
+  },
+  "data": {
+    "corpus_path": "data/corpus.txt",
+    "val_ratio": 0.15,
+    "batch_size": 6,
+    "seed": 20261123
+  },
+  "train": {
+    "total_steps": 240,
+    "warmup_steps": 24,
+    "max_lr": 0.025,
+    "min_lr": 0.002,
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "eps": 1e-8,
+    "weight_decay": 0.01,
+    "max_grad_norm": 1.0,
+    "eval_interval": 30,
+    "eval_batches": 6,
+    "log_interval": 20,
+    "checkpoint_dir": "checkpoints",
+    "best_checkpoint": "checkpoints/best.safetensors",
+    "latest_checkpoint": "checkpoints/latest.safetensors",
+    "metrics_path": "checkpoints/metrics.json"
+  },
+  "generate": {
+    "checkpoint_path": "checkpoints/best.safetensors",
+    "max_new_tokens": 96,
+    "temperature": 0.5,
+    "top_k": 8,
+    "seed": 42,
+    "prompts": [
+      "The transformer ",
+      "Attention weights ",
+      "In the quiet lab, "
+    ]
+  }
+}

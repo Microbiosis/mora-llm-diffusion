@@ -1,0 +1,178 @@
+-- Corpus dataset loader, sliding-window multi-batch sampler, causal mask, and RoPE tables.
+
+import "src/tokenizer.mora"
+
+export struct TextDataset
+  train_tokens: list<int>
+  val_tokens: list<int>
+  train_starts: list<int>
+  val_starts: list<int>
+  seq_len: int = 16
+  vocab_size: int = 101
+  eye_rows: list<list<float>>
+end
+
+export task build_eye_rows(vocab_size: int): list<list<float>>
+  let rows: list<list<float>> = []
+  let i = 0
+  while i < vocab_size
+    let row: list<float> = []
+    let j = 0
+    while j < vocab_size
+      if i == j then
+        assign row = row.push(1.0)
+      else
+        assign row = row.push(0.0)
+      end
+      assign j = j + 1
+    end
+    assign rows = rows.push(row)
+    assign i = i + 1
+  end
+  return rows
+end
+
+task make_starts(num_tokens: int, seq_len: int, stride: int = 1): list<int>
+  let starts: list<int> = []
+  let limit = num_tokens - seq_len - 1
+  let i = 0
+  while i <= limit
+    assign starts = starts.push(i)
+    assign i = i + stride
+  end
+  return starts
+end
+
+task shuffle_ints(xs: list<int>, seed: int): list<int>
+  random.seed(seed)
+  return random.shuffle(xs)
+end
+
+export task load_dataset(corpus_path: string, tok: ByteTokenizer, seq_len: int, val_ratio: float = 0.15, seed: int = 20261123): TextDataset
+  let raw = file.read_text(corpus_path)
+  let tokens = tok.encode(raw, true, true)
+  let total = tokens.len()
+  assert(total >= seq_len + 2, "corpus too short for configured seq_len")
+
+  let min_split = seq_len + 2
+  let val_len = int(float(total) * val_ratio)
+  if val_len < min_split then
+    assign val_len = min_split
+  end
+  let split_idx = total - val_len
+  if split_idx < min_split then
+    assign split_idx = total / 2
+  end
+
+  let train_tokens: list<int> = []
+  let val_tokens: list<int> = []
+  let i = 0
+  while i < total
+    if i < split_idx then
+      assign train_tokens = train_tokens.push(tokens[i])
+    else
+      assign val_tokens = val_tokens.push(tokens[i])
+    end
+    assign i = i + 1
+  end
+
+  let train_starts = shuffle_ints(make_starts(train_tokens.len(), seq_len, 1), seed)
+  let val_starts = make_starts(val_tokens.len(), seq_len, 2)
+  assert(train_starts.len() > 0, "no training windows generated")
+  assert(val_starts.len() > 0, "no validation windows generated")
+
+  let eye_rows = build_eye_rows(tok.vocab_size)
+  return TextDataset(train_tokens = train_tokens, val_tokens = val_tokens, train_starts = train_starts, val_starts = val_starts, seq_len = seq_len, vocab_size = tok.vocab_size, eye_rows = eye_rows)
+end
+
+export task encode_ids_onehot(batch_ids: list<list<int>>, eye_rows: list<list<float>>): Tensor<f64, _, cpu>
+  let batch_rows: list<list<list<float>>> = []
+  for seq in batch_ids
+    let seq_rows: list<list<float>> = []
+    for tid in seq
+      assign seq_rows = seq_rows.push(eye_rows[tid])
+    end
+    assign batch_rows = batch_rows.push(seq_rows)
+  end
+  return Tensor::from_list(batch_rows, "f64")
+end
+
+export task make_batch(ds: TextDataset, is_val: bool, batch_idx: int, batch_size: int): list<Tensor<f64, _, cpu>>
+  let tokens = if is_val then ds.val_tokens else ds.train_tokens end
+  let starts = if is_val then ds.val_starts else ds.train_starts end
+  let n_starts = starts.len()
+  let seq_len = ds.seq_len
+
+  let x_batch: list<list<int>> = []
+  let y_batch: list<list<int>> = []
+
+  let b = 0
+  while b < batch_size
+    let win_idx = (batch_idx * batch_size + b) % n_starts
+    let s = starts[win_idx]
+    let x_seq: list<int> = []
+    let y_seq: list<int> = []
+    let t = 0
+    while t < seq_len
+      assign x_seq = x_seq.push(tokens[s + t])
+      assign y_seq = y_seq.push(tokens[s + t + 1])
+      assign t = t + 1
+    end
+    assign x_batch = x_batch.push(x_seq)
+    assign y_batch = y_batch.push(y_seq)
+    assign b = b + 1
+  end
+
+  return [encode_ids_onehot(x_batch, ds.eye_rows), encode_ids_onehot(y_batch, ds.eye_rows)]
+end
+
+export task build_causal_mask(seq_len: int): Tensor<f64, _, cpu>
+  let rows: list<list<float>> = []
+  let r = 0
+  while r < seq_len
+    let row: list<float> = []
+    let c = 0
+    while c < seq_len
+      if c <= r then
+        assign row = row.push(0.0)
+      else
+        assign row = row.push(-1000000000.0)
+      end
+      assign c = c + 1
+    end
+    assign rows = rows.push(row)
+    assign r = r + 1
+  end
+  return Tensor::from_list(rows, "f64")
+end
+
+export task build_rope_tables(seq_len: int, head_dim: int, theta: float = 10000.0): list<Tensor<f64, _, cpu>>
+  let half = head_dim / 2
+  let cos_rows: list<list<float>> = []
+  let sin_rows: list<list<float>> = []
+  let t = 0
+  while t < seq_len
+    let c_row: list<float> = []
+    let s_row: list<float> = []
+    let i = 0
+    while i < half
+      let freq = 1.0 / (theta ** (float(2 * i) / float(head_dim)))
+      let angle = float(t) * freq
+      let c = math.cos(angle)
+      let s = math.sin(angle)
+      assign c_row = c_row.push(c).push(c)
+      assign s_row = s_row.push(s).push(s)
+      assign i = i + 1
+    end
+    assign cos_rows = cos_rows.push(c_row)
+    assign sin_rows = sin_rows.push(s_row)
+    assign t = t + 1
+  end
+  let cos_t = Tensor::from_list(cos_rows, "f64").reshape([1, 1, seq_len, head_dim])
+  let sin_t = Tensor::from_list(sin_rows, "f64").reshape([1, 1, seq_len, head_dim])
+  return [cos_t, sin_t]
+end
+
+export task build_rope_rot_matrix(): Tensor<f64, [2, 2], cpu>
+  return tensor([[0.0, 1.0], [-1.0, 0.0]], dtype = "f64", device = "cpu")
+end

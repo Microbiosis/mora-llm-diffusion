@@ -1,0 +1,134 @@
+-- Unified Continuous Latent Encoder / Decoder for CAD-BEBC (Bridges Text <-> Continuous Block Latent Space).
+
+import "std/nn/safetensors"
+import "src/config.mora"
+import "src/tokenizer.mora"
+import "src/data.mora"
+import "src/model.mora"
+import "src/checkpoint.mora"
+import "src/sampler.mora"
+
+export struct EncodedPrompt
+  z_in: Tensor<f64, _, cpu>
+  active_prefix: int = 0
+  prompt_ids: list<int>
+end
+
+export struct LatentCodec
+  tok: ByteTokenizer
+  eye_rows: list<list<float>>
+  llama_cfg: ModelConfig
+  llama_params: MiniLLaMAParams
+  seq_len: int = 16
+  d_model: int = 32
+end
+
+export task load_latent_codec(app_cfg_path: string = "config/default.json", llama_ckpt_path: string = "models/mini_llama_frozen.safetensors"): LatentCodec
+  let app = load_config(app_cfg_path)
+  let mc = app.model
+  let tok = create_tokenizer()
+  let eye = build_eye_rows(tok.vocab_size)
+  let ckpt = load_checkpoint(llama_ckpt_path, mc.n_layers, "cpu")
+  return LatentCodec(tok = tok, eye_rows = eye, llama_cfg = mc, llama_params = ckpt.params, seq_len = mc.seq_len, d_model = mc.d_model)
+end
+
+export task encode_text_window_ids(codec: LatentCodec, text: string): list<int>
+  let ids = codec.tok.encode(text, true, false)
+  let seq = codec.seq_len
+  let out: list<int> = []
+  let start = if ids.len() > seq then ids.len() - seq else 0 end
+  let i = start
+  while i < ids.len()
+    assign out = out.push(ids[i])
+    assign i = i + 1
+  end
+  while out.len() < seq
+    assign out = out.push(codec.tok.pad_id)
+  end
+  return out
+end
+
+export task encode_ids_to_latent(codec: LatentCodec, batch_ids: list<list<int>>): Tensor<f64, _, cpu>
+  let oh = encode_ids_onehot(batch_ids, codec.eye_rows)
+  return no_grad
+  oh @ codec.llama_params.tok_emb
+end
+end
+
+export task encode_prefix_with_masked_suffix(codec: LatentCodec, prompt: string, prefix_len: int, noise_scale: float = 0.25, seed: int = 42): EncodedPrompt
+  -- Encodes prompt into prefix positions [0..prefix_len) and initializes noisy continuous latents for [prefix_len..seq_len)
+  let ids = codec.tok.encode(prompt, true, false)
+  let seq = codec.seq_len
+  let active_prefix = if ids.len() < prefix_len then ids.len() else prefix_len end
+
+  let padded: list<int> = []
+  let i = 0
+  while i < active_prefix
+    assign padded = padded.push(ids[i])
+    assign i = i + 1
+  end
+  while padded.len() < seq
+    assign padded = padded.push(codec.tok.pad_id)
+  end
+
+  let z_clean_prefix = encode_ids_to_latent(codec, [padded])
+  random.seed(seed)
+  let eps = Tensor::randn([1, seq, codec.d_model], "f64", "cpu") * noise_scale
+
+  -- Keep prefix positions clean and add diffusion noise on generation suffix positions
+  let rows: list<list<float>> = []
+  let z_list: list<any> = z_clean_prefix.to_list()
+  let e_list: list<any> = eps.to_list()
+  let t = 0
+  while t < seq
+    let z_row: list<any> = z_list[0][t]
+    let e_row: list<any> = e_list[0][t]
+    let out_row: list<float> = []
+    let ch = 0
+    while ch < codec.d_model
+      if t < active_prefix then
+        assign out_row = out_row.push(float(z_row[ch]))
+      else
+        assign out_row = out_row.push(float(z_row[ch]) + float(e_row[ch]))
+      end
+      assign ch = ch + 1
+    end
+    assign rows = rows.push(out_row)
+    assign t = t + 1
+  end
+
+  return EncodedPrompt(z_in = Tensor::from_list([rows], "f64"), active_prefix = active_prefix, prompt_ids = ids)
+end
+
+export task decode_latent_to_text(codec: LatentCodec, z: Tensor<f64, _, cpu>, temperature: float = 0.0, top_k: int = 8): string
+  -- Nearest-embedding cosine/dot decode or LM-head decode into discrete tokens
+  let logits = no_grad
+  z @ codec.llama_params.tok_emb.transpose(0, 1)
+end
+let shp = logits.shape()
+let seq = shp[1]
+let ids: list<int> = []
+let t = 0
+while t < seq
+  let row: list<any> = logits[0][t].to_list()
+  let tid = sample_next_token(row, temperature, top_k)
+  assign ids = ids.push(tid)
+  assign t = t + 1
+end
+return codec.tok.decode(ids)
+end
+
+export task decode_next_tokens_via_lm_head(codec: LatentCodec, z: Tensor<f64, _, cpu>, temperature: float = 0.4, top_k: int = 8): string
+  let logits = decode_latent_to_logits(codec.llama_params, z, codec.llama_cfg.rms_eps)
+  let shp = logits.shape()
+  let seq = shp[1]
+  let ids: list<int> = []
+  let t = 0
+  while t < seq
+    let row: list<any> = logits[0][t].to_list()
+    let tid = sample_next_token(row, temperature, top_k)
+    assign ids = ids.push(tid)
+    assign t = t + 1
+  end
+  return codec.tok.decode(ids)
+end

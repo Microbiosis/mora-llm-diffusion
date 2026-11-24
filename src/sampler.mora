@@ -1,0 +1,149 @@
+-- Autoregressive Text Generation & Top-K / Temperature Sampling for Mini-LLaMA.
+
+import "src/config.mora"
+import "src/tokenizer.mora"
+import "src/data.mora"
+import "src/model.mora"
+
+export task argmax_list(vals: list<any>): int
+  let best_i = 0
+  let best_v = float(vals[0])
+  let i = 1
+  let n = vals.len()
+  while i < n
+    let v = float(vals[i])
+    if v > best_v then
+      assign best_v = v
+      assign best_i = i
+    end
+    assign i = i + 1
+  end
+  return best_i
+end
+
+task contains_int(xs: list<int>, target: int): bool
+  for x in xs
+    if x == target then
+      return true
+    end
+  end
+  return false
+end
+
+export task sample_next_token(logits_row: list<any>, temperature: float = 0.5, top_k: int = 8): int
+  let n = logits_row.len()
+  if temperature <= 0.0 then
+    return argmax_list(logits_row)
+  end
+
+  let scaled: list<float> = []
+  let i = 0
+  while i < n
+    assign scaled = scaled.push(float(logits_row[i]) / temperature)
+    assign i = i + 1
+  end
+
+  -- Apply top-k filtering when 0 < top_k < vocab_size
+  let active = scaled
+  if top_k > 0 and top_k < n then
+    let top_indices: list<int> = []
+    let sel = 0
+    while sel < top_k
+      let best_idx = -1
+      let best_val = -1000000000000000000.0
+      let j = 0
+      while j < n
+        if !contains_int(top_indices, j) and scaled[j] > best_val then
+          assign best_val = scaled[j]
+          assign best_idx = j
+        end
+        assign j = j + 1
+      end
+      if best_idx >= 0 then
+        assign top_indices = top_indices.push(best_idx)
+      end
+      assign sel = sel + 1
+    end
+    let masked: list<float> = []
+    let m = 0
+    while m < n
+      if contains_int(top_indices, m) then
+        assign masked = masked.push(scaled[m])
+      else
+        assign masked = masked.push(-1000000000.0)
+      end
+      assign m = m + 1
+    end
+    assign active = masked
+  end
+
+  -- Numerically stable softmax
+  let max_v = active[0]
+  let idx = 1
+  while idx < n
+    if active[idx] > max_v then
+      assign max_v = active[idx]
+    end
+    assign idx = idx + 1
+  end
+
+  let exps: list<float> = []
+  let sum_exp = 0.0
+  let p_i = 0
+  while p_i < n
+    let ev = math.exp(active[p_i] - max_v)
+    assign exps = exps.push(ev)
+    assign sum_exp = sum_exp + ev
+    assign p_i = p_i + 1
+  end
+
+  -- Multinomial draw
+  let r = random.rand_float(0.0, 1.0) * sum_exp
+  let cdf = 0.0
+  let s_i = 0
+  while s_i < n
+    assign cdf = cdf + exps[s_i]
+    if cdf >= r then
+      return s_i
+    end
+    assign s_i = s_i + 1
+  end
+  return n - 1
+end
+
+export task generate_text(p: MiniLLaMAParams, cfg: ModelConfig, tok: ByteTokenizer, eye_rows: list<list<float>>, causal_mask: Tensor<f64, _, cpu>, rope_cos: Tensor<f64, _, cpu>, rope_sin: Tensor<f64, _, cpu>, rot_j: Tensor<f64, [2, 2], cpu>, prompt: string, max_new_tokens: int, temperature: float, top_k: int, seed: int = 42): string
+  random.seed(seed)
+  let ids = tok.encode(prompt, true, false)
+  let seq_len = cfg.seq_len
+
+  let step = 0
+  while step < max_new_tokens
+    let cur_len = ids.len()
+    let start_pos = if cur_len > seq_len then cur_len - seq_len else 0 end
+    let active_len = cur_len - start_pos
+
+    let window: list<int> = []
+    let wi = start_pos
+    while wi < cur_len
+      assign window = window.push(ids[wi])
+      assign wi = wi + 1
+    end
+    while window.len() < seq_len
+      assign window = window.push(tok.pad_id)
+    end
+
+    let x_in = encode_ids_onehot([window], eye_rows)
+    let logits = eval_logits(p, cfg, x_in, causal_mask, rope_cos, rope_sin, rot_j)
+    let row: list<any> = logits[0][active_len - 1].to_list()
+    let next_id = sample_next_token(row, temperature, top_k)
+
+    if next_id == tok.eos_id then
+      assign step = max_new_tokens
+    else
+      assign ids = ids.push(next_id)
+      assign step = step + 1
+    end
+  end
+
+  return tok.decode(ids)
+end

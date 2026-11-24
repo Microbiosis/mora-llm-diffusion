@@ -1,0 +1,260 @@
+-- Multi-Layer Continuous Space Block-Diffusion Backbone & Structured/Corpus Latent Samplers.
+
+import "src/diffusion/config.mora"
+
+export struct BackboneParams
+  in_proj: Tensor<f64, _, cpu>
+  pos_emb: Tensor<f64, _, cpu>
+  time_proj: Tensor<f64, _, cpu>
+  attn_norm: Tensor<f64, _, cpu>
+  wq: Tensor<f64, _, cpu>
+  wk: Tensor<f64, _, cpu>
+  wv: Tensor<f64, _, cpu>
+  wo: Tensor<f64, _, cpu>
+  ffn_norm: Tensor<f64, _, cpu>
+  w_gate: Tensor<f64, _, cpu>
+  w_up: Tensor<f64, _, cpu>
+  w_down: Tensor<f64, _, cpu>
+  out_norm: Tensor<f64, _, cpu>
+  out_proj: Tensor<f64, _, cpu>
+end
+
+export task init_backbone_params(cfg: DiffModelConfig, seed: int = 20261123): BackboneParams
+  random.seed(seed)
+  let l = cfg.n_layers
+  let s = cfg.num_blocks * cfg.block_size
+  let d = cfg.d_model
+  let h = cfg.ffn_hidden
+  let sc = 0.1
+  let res_sc = sc / math.sqrt(float(2 * l))
+
+  return BackboneParams(in_proj = Tensor::randn([d, d], "f64", "cpu") * sc, pos_emb = Tensor::randn([1, s, d], "f64", "cpu") * sc, time_proj = Tensor::randn([1, d], "f64", "cpu") * sc, attn_norm = Tensor::ones([l, d], "f64", "cpu"), wq = Tensor::randn([l, d, d], "f64", "cpu") * sc, wk = Tensor::randn([l, d, d], "f64", "cpu") * sc, wv = Tensor::randn([l, d, d], "f64", "cpu") * sc, wo = Tensor::randn([l, d, d], "f64", "cpu") * res_sc, ffn_norm = Tensor::ones([l, d], "f64", "cpu"), w_gate = Tensor::randn([l, d, h], "f64", "cpu") * sc, w_up = Tensor::randn([l, d, h], "f64", "cpu") * sc, w_down = Tensor::randn([l, h, d], "f64", "cpu") * res_sc, out_norm = Tensor::ones([d], "f64", "cpu"), out_proj = Tensor::randn([d, d], "f64", "cpu") * sc)
+end
+
+export task count_backbone_parameters(bp: BackboneParams): int
+  return bp.in_proj.numel() + bp.pos_emb.numel() + bp.time_proj.numel() + bp.attn_norm.numel() + bp.wq.numel() + bp.wk.numel() + bp.wv.numel() + bp.wo.numel() + bp.ffn_norm.numel() + bp.w_gate.numel() + bp.w_up.numel() + bp.w_down.numel() + bp.out_norm.numel() + bp.out_proj.numel()
+end
+
+export task backbone_forward_raw(p_in: Tensor<f64, _, cpu>, p_pos: Tensor<f64, _, cpu>, p_time: Tensor<f64, _, cpu>, p_an: Tensor<f64, _, cpu>, p_wq: Tensor<f64, _, cpu>, p_wk: Tensor<f64, _, cpu>, p_wv: Tensor<f64, _, cpu>, p_wo: Tensor<f64, _, cpu>, p_fn: Tensor<f64, _, cpu>, p_wg: Tensor<f64, _, cpu>, p_wu: Tensor<f64, _, cpu>, p_wd: Tensor<f64, _, cpu>, p_on: Tensor<f64, _, cpu>, p_out: Tensor<f64, _, cpu>, z_t: Tensor<f64, _, cpu>, tau_t: Tensor<f64, _, cpu>, struct_bias: Tensor<f64, _, cpu>, n_layers: int, n_heads: int, head_dim: int, rms_eps: float): Tensor<f64, _, cpu>
+  let shp = z_t.shape()
+  let bsz = shp[0]
+  let seq = shp[1]
+  let d = shp[2]
+  let scale = 1.0 / math.sqrt(float(head_dim))
+
+  let t_cond = tau_t @ p_time
+  let h = (z_t @ p_in) + p_pos + t_cond.reshape([1, 1, d])
+
+  let l = 0
+  while l < n_layers
+    let hn = h.rms_norm(rms_eps) * p_an[l]
+    let q = (hn @ p_wq[l]).reshape([bsz, seq, n_heads, head_dim]).transpose(1, 2)
+    let k = (hn @ p_wk[l]).reshape([bsz, seq, n_heads, head_dim]).transpose(1, 2)
+    let v = (hn @ p_wv[l]).reshape([bsz, seq, n_heads, head_dim]).transpose(1, 2)
+
+    let scores = (q @ k.transpose(-2, -1)) * scale + struct_bias
+    let attn_w = scores.softmax()
+    let ctx = (attn_w @ v).transpose(1, 2).reshape([bsz, seq, d])
+    assign h = h + (ctx @ p_wo[l])
+
+    let fn_in = h.rms_norm(rms_eps) * p_fn[l]
+    let gate = (fn_in @ p_wg[l]).silu()
+    let up = fn_in @ p_wu[l]
+    assign h = h + ((gate * up) @ p_wd[l])
+    assign l = l + 1
+  end
+
+  let h_scaled = h * p_on.reshape([1, 1, d])
+  return h_scaled @ p_out
+end
+
+export task backbone_predict_x0(bp: BackboneParams, cfg: DiffModelConfig, z_t: Tensor<f64, _, cpu>, tau_val: float, struct_bias: Tensor<f64, _, cpu>): Tensor<f64, _, cpu>
+  let tau_t = tensor([[tau_val]], dtype = "f64", device = "cpu")
+  return no_grad
+  backbone_forward_raw(bp.in_proj, bp.pos_emb, bp.time_proj, bp.attn_norm, bp.wq, bp.wk, bp.wv, bp.wo, bp.ffn_norm, bp.w_gate, bp.w_up, bp.w_down, bp.out_norm, bp.out_proj, z_t, tau_t, struct_bias, cfg.n_layers, cfg.n_heads, cfg.head_dim, cfg.rms_eps)
+end
+end
+
+export task backbone_ode_step(bp: BackboneParams, cfg: DiffModelConfig, z_t: Tensor<f64, _, cpu>, step_t: int, struct_bias: Tensor<f64, _, cpu>): Tensor<f64, _, cpu>
+  let tau_val = float(step_t) / float(cfg.num_steps)
+  let x0_hat = backbone_predict_x0(bp, cfg, z_t, tau_val, struct_bias)
+  let inv_t = 1.0 / float(step_t)
+  return z_t + (x0_hat - z_t) * inv_t
+end
+
+export task backbone_loss_fn(p_in: Tensor<f64, _, cpu>, p_pos: Tensor<f64, _, cpu>, p_time: Tensor<f64, _, cpu>, p_an: Tensor<f64, _, cpu>, p_wq: Tensor<f64, _, cpu>, p_wk: Tensor<f64, _, cpu>, p_wv: Tensor<f64, _, cpu>, p_wo: Tensor<f64, _, cpu>, p_fn: Tensor<f64, _, cpu>, p_wg: Tensor<f64, _, cpu>, p_wu: Tensor<f64, _, cpu>, p_wd: Tensor<f64, _, cpu>, p_on: Tensor<f64, _, cpu>, p_out: Tensor<f64, _, cpu>, z_t: Tensor<f64, _, cpu>, x_0: Tensor<f64, _, cpu>, tau_t: Tensor<f64, _, cpu>, struct_bias: Tensor<f64, _, cpu>, n_layers: int, n_heads: int, head_dim: int, rms_eps: float): float
+  let pred = backbone_forward_raw(p_in, p_pos, p_time, p_an, p_wq, p_wk, p_wv, p_wo, p_fn, p_wg, p_wu, p_wd, p_on, p_out, z_t, tau_t, struct_bias, n_layers, n_heads, head_dim, rms_eps)
+  let diff = pred - x_0
+  return (diff * diff).mean()
+end
+
+export task compute_consistency_error(bp: BackboneParams, cfg: DiffModelConfig, x_obs: Tensor<f64, _, cpu>, z_clean: Tensor<f64, _, cpu>, struct_bias: Tensor<f64, _, cpu>, seed: int, probe_sigma: float = 0.15, probe_t: float = 0.25): float
+  random.seed(seed)
+  let eps = Tensor::randn(z_clean.shape(), "f64", "cpu") * probe_sigma
+  let z_probe = z_clean + eps
+  let pred = backbone_predict_x0(bp, cfg, z_probe, probe_t, struct_bias)
+  let self_diff = pred - z_clean
+  let obs_diff = z_clean - x_obs
+  return float((self_diff * self_diff).mean() + 0.15 * (obs_diff * obs_diff).mean())
+end
+
+export task sample_structured_batch(batch_size: int, num_blocks: int, block_size: int, d_model: int, regime: string, seed: int): list<Tensor<f64, _, cpu>>
+  random.seed(seed)
+  let seq = num_blocks * block_size
+  let base_signal = Tensor::randn([batch_size, 1, d_model], "f64", "cpu") * 0.6
+
+  let x0_rows: list<list<list<float>>> = []
+  let obs_rows: list<list<list<float>>> = []
+  let bs_list: list<any> = base_signal.to_list()
+
+  let b = 0
+  while b < batch_size
+    let b_vec: list<any> = bs_list[b][0]
+    let seq_x0: list<list<float>> = []
+    let seq_obs: list<list<float>> = []
+    let t = 0
+    while t < seq
+      let blk = t / block_size
+      let pos_in_blk = t % block_size
+      let row_x0: list<float> = []
+      let row_obs: list<float> = []
+      let ch = 0
+      while ch < d_model
+        let v_root = float(b_vec[ch])
+        let phase = float(pos_in_blk + 1) * 0.3 + float(ch) * 0.15
+        let val = 0.0
+        if regime == "simple" then
+          let scale_b = 1.0 - 0.12 * float(blk)
+          assign val = v_root * scale_b + 0.25 * math.cos(phase)
+        else
+          if regime == "complex" then
+            let cross = math.sin(v_root * 2.2) + 0.5 * math.cos(float(blk) * 1.1 + phase)
+            assign val = 0.7 * v_root + 0.45 * cross
+          else
+            assign val = 2.4 * math.sin(v_root * 3.5 + float(blk)) + random.rand_float(-1.8, 1.8)
+          end
+        end
+        let noisy_obs = val + random.rand_float(-0.12, 0.12)
+        if regime == "complex" and pos_in_blk % 2 == 1 then
+          -- Corrupt odd positions within each block so bidirectional intra-block + inter-block attention is needed
+          assign noisy_obs = val * 0.15 + random.rand_float(-0.75, 0.75)
+        end
+        assign row_x0 = row_x0.push(val)
+        assign row_obs = row_obs.push(noisy_obs)
+        assign ch = ch + 1
+      end
+      assign seq_x0 = seq_x0.push(row_x0)
+      assign seq_obs = seq_obs.push(row_obs)
+      assign t = t + 1
+    end
+    assign x0_rows = x0_rows.push(seq_x0)
+    assign obs_rows = obs_rows.push(seq_obs)
+    assign b = b + 1
+  end
+
+  return [Tensor::from_list(obs_rows, "f64"), Tensor::from_list(x0_rows, "f64")]
+end
+
+export task load_corpus_continuous_batch(corpus_path: string, batch_size: int, num_blocks: int, block_size: int, d_model: int, corrupt_odd: bool, seed: int): list<Tensor<f64, _, cpu>>
+  -- Converts real text windows from corpus_path into continuous smooth multi-block latent embeddings.
+  let raw_bytes: list<any> = Tensor::from_utf8(file.read_text(corpus_path)).to_list()
+  let n_bytes = raw_bytes.len()
+  let seq = num_blocks * block_size
+  assert(n_bytes > seq + 4, "corpus too small for continuous block sampling")
+
+  random.seed(seed)
+  let obs_rows: list<list<list<float>>> = []
+  let x0_rows: list<list<list<float>>> = []
+
+  let b = 0
+  while b < batch_size
+    let start = random.rand_int(0, n_bytes - seq)
+    let seq_x0: list<list<float>> = []
+    let seq_obs: list<list<float>> = []
+    let t = 0
+    while t < seq
+      let byte_val = float(raw_bytes[start + t]) / 128.0 - 0.5
+      let pos_in_blk = t % block_size
+      let row_x0: list<float> = []
+      let row_obs: list<float> = []
+      let ch = 0
+      while ch < d_model
+        let angle = byte_val * (float((ch % 8) + 1) * 0.6) + float(t) * 0.1
+        let val = 0.55 * math.sin(angle) + 0.35 * byte_val
+        let noisy = val + random.rand_float(-0.1, 0.1)
+        if corrupt_odd and pos_in_blk % 2 == 1 then
+          assign noisy = val * 0.15 + random.rand_float(-0.7, 0.7)
+        end
+        assign row_x0 = row_x0.push(val)
+        assign row_obs = row_obs.push(noisy)
+        assign ch = ch + 1
+      end
+      assign seq_x0 = seq_x0.push(row_x0)
+      assign seq_obs = seq_obs.push(row_obs)
+      assign t = t + 1
+    end
+    assign x0_rows = x0_rows.push(seq_x0)
+    assign obs_rows = obs_rows.push(seq_obs)
+    assign b = b + 1
+  end
+
+  return [Tensor::from_list(obs_rows, "f64"), Tensor::from_list(x0_rows, "f64")]
+end
+
+export task pretrain_backbone(bp: BackboneParams, cfg: DiffModelConfig, struct_bias: Tensor<f64, _, cpu>, steps: int, lr: float, seed: int): BackboneParams
+  let cur = bp
+  let m_list: list<Tensor<f64, _, cpu>> = [Tensor::zeros(cur.in_proj.shape(), "f64", "cpu"), Tensor::zeros(cur.pos_emb.shape(), "f64", "cpu"), Tensor::zeros(cur.time_proj.shape(), "f64", "cpu"), Tensor::zeros(cur.attn_norm.shape(), "f64", "cpu"), Tensor::zeros(cur.wq.shape(), "f64", "cpu"), Tensor::zeros(cur.wk.shape(), "f64", "cpu"), Tensor::zeros(cur.wv.shape(), "f64", "cpu"), Tensor::zeros(cur.wo.shape(), "f64", "cpu"), Tensor::zeros(cur.ffn_norm.shape(), "f64", "cpu"), Tensor::zeros(cur.w_gate.shape(), "f64", "cpu"), Tensor::zeros(cur.w_up.shape(), "f64", "cpu"), Tensor::zeros(cur.w_down.shape(), "f64", "cpu"), Tensor::zeros(cur.out_norm.shape(), "f64", "cpu"), Tensor::zeros(cur.out_proj.shape(), "f64", "cpu")]
+  let v_list: list<Tensor<f64, _, cpu>> = [Tensor::zeros(cur.in_proj.shape(), "f64", "cpu"), Tensor::zeros(cur.pos_emb.shape(), "f64", "cpu"), Tensor::zeros(cur.time_proj.shape(), "f64", "cpu"), Tensor::zeros(cur.attn_norm.shape(), "f64", "cpu"), Tensor::zeros(cur.wq.shape(), "f64", "cpu"), Tensor::zeros(cur.wk.shape(), "f64", "cpu"), Tensor::zeros(cur.wv.shape(), "f64", "cpu"), Tensor::zeros(cur.wo.shape(), "f64", "cpu"), Tensor::zeros(cur.ffn_norm.shape(), "f64", "cpu"), Tensor::zeros(cur.w_gate.shape(), "f64", "cpu"), Tensor::zeros(cur.w_up.shape(), "f64", "cpu"), Tensor::zeros(cur.w_down.shape(), "f64", "cpu"), Tensor::zeros(cur.out_norm.shape(), "f64", "cpu"), Tensor::zeros(cur.out_proj.shape(), "f64", "cpu")]
+
+  let vg = value_and_grad(backbone_loss_fn, argnums = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
+  let beta1 = 0.9
+  let beta2 = 0.999
+  let eps = 0.00000001
+  let b1p = 1.0
+  let b2p = 1.0
+
+  let st = 1
+  while st <= steps
+    let reg = if st % 2 == 0 then "simple" else "complex" end
+    let pair = sample_structured_batch(4, cfg.num_blocks, cfg.block_size, cfg.d_model, reg, seed + st * 17)
+    let x_obs = pair[0]
+    let x_0 = pair[1]
+    random.seed(seed + st * 31)
+    let step_idx = random.rand_int(0, cfg.num_steps + 1)
+    let tau_val = float(step_idx) / float(cfg.num_steps)
+    let tau_t = tensor([[tau_val]], dtype = "f64", device = "cpu")
+    let noise = x_obs + Tensor::randn(x_0.shape(), "f64", "cpu") * 0.25
+    let z_t = x_0 * (1.0 - tau_val) + noise * tau_val
+
+    let res = vg(cur.in_proj, cur.pos_emb, cur.time_proj, cur.attn_norm, cur.wq, cur.wk, cur.wv, cur.wo, cur.ffn_norm, cur.w_gate, cur.w_up, cur.w_down, cur.out_norm, cur.out_proj, z_t, x_0, tau_t, struct_bias, cfg.n_layers, cfg.n_heads, cfg.head_dim, cfg.rms_eps)
+    let gs: list<Tensor<f64, _, cpu>> = res[1]
+
+    assign b1p = b1p * beta1
+    assign b2p = b2p * beta2
+    let bc1 = 1.0 - b1p
+    let bc2 = 1.0 - b2p
+
+    let p_vec: list<Tensor<f64, _, cpu>> = [cur.in_proj, cur.pos_emb, cur.time_proj, cur.attn_norm, cur.wq, cur.wk, cur.wv, cur.wo, cur.ffn_norm, cur.w_gate, cur.w_up, cur.w_down, cur.out_norm, cur.out_proj]
+    let next_p: list<Tensor<f64, _, cpu>> = []
+    let next_m: list<Tensor<f64, _, cpu>> = []
+    let next_v: list<Tensor<f64, _, cpu>> = []
+
+    let i = 0
+    while i < 14
+      let m_new = m_list[i] * beta1 + gs[i] * (1.0 - beta1)
+      let v_new = v_list[i] * beta2 + (gs[i] * gs[i]) * (1.0 - beta2)
+      let p_new = p_vec[i] - ((m_new / bc1) / ((v_new / bc2).sqrt() + eps)) * lr
+      assign next_p = next_p.push(p_new)
+      assign next_m = next_m.push(m_new)
+      assign next_v = next_v.push(v_new)
+      assign i = i + 1
+    end
+
+    assign cur = BackboneParams(in_proj = next_p[0], pos_emb = next_p[1], time_proj = next_p[2], attn_norm = next_p[3], wq = next_p[4], wk = next_p[5], wv = next_p[6], wo = next_p[7], ffn_norm = next_p[8], w_gate = next_p[9], w_up = next_p[10], w_down = next_p[11], out_norm = next_p[12], out_proj = next_p[13])
+    assign m_list = next_m
+    assign v_list = next_v
+    assign st = st + 1
+  end
+
+  return cur
+end

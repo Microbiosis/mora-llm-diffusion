@@ -1,0 +1,41 @@
+-- Standalone External Model HTTP Service (Exposes /v1/predict & /health via std/net/http).
+
+import "std/net/http"
+import "std/nn/safetensors"
+import "src/diffusion/config.mora"
+import "src/diffusion/expert.mora"
+
+export task make_expert_router(exp: ExternalFastExpert): Router
+  let r = router()
+  assign r = r.get("/health", fn(req: HttpRequest, _stream: tcp_stream | tls_stream)
+    let info: dict<string, any> = {}
+    assign info = info.set("status", "ok").set("model", exp.model_name).set("params", count_expert_parameters(exp))
+    return json_response(200, info)
+  end)
+  assign r = r.post("/v1/predict", fn(req: HttpRequest, _stream: tcp_stream | tls_stream)
+    let payload: dict<string, any> = json.parse(req.body)
+    let inp_raw = payload.get("input")
+    if type_of(inp_raw) != "list" then
+      let err: dict<string, any> = {}
+      assign err = err.set("error", "missing 'input' array")
+      return json_response(400, err)
+    end
+    let inp_list: list<any> = json.parse(json.stringify(inp_raw))
+    let x_obs = Tensor::from_list(inp_list, "f64")
+    let pred = expert_predict(exp, x_obs)
+    let out: dict<string, any> = {}
+    assign out = out.set("model", exp.model_name).set("shape", pred.shape()).set("prediction", pred.to_list())
+    return json_response(200, out)
+  end)
+  return r
+end
+
+task main()
+  let cfg = load_diffusion_config("config/diffusion.json")
+  let local_cfg = ExternalExpertConfig(mode = "safetensors", http_addr = cfg.external_expert.http_addr, http_path = cfg.external_expert.http_path, model_name = cfg.external_expert.model_name, timeout_ms = cfg.external_expert.timeout_ms, checkpoint_path = cfg.external_expert.checkpoint_path)
+  let exp = load_external_expert(local_cfg, cfg.model.rms_eps, "cpu")
+  print("=== Starting External Expert HTTP Service ===")
+  print("listen:", cfg.external_expert.http_addr, "| endpoint:", cfg.external_expert.http_path, "| params:", count_expert_parameters(exp))
+  let r = make_expert_router(exp)
+  r.serve(cfg.external_expert.http_addr)
+end
