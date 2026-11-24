@@ -1,0 +1,54 @@
+{
+  "project": "mora-cad-bebc-tinystories",
+  "version": "1.0.0",
+  "model": {
+    "architecture": "mini-llama-rope-gqa-swiglu",
+    "vocab_size": 101,
+    "seq_len": 64,
+    "n_layers": 4,
+    "d_model": 128,
+    "n_q_heads": 8,
+    "n_kv_heads": 2,
+    "head_dim": 16,
+    "ffn_hidden": 256,
+    "rms_eps": 1e-5,
+    "rope_theta": 10000.0,
+    "init_scale": 0.08
+  },
+  "data": {
+    "corpus_path": "data/tinystories_sample.txt",
+    "val_ratio": 0.05,
+    "batch_size": 8,
+    "seed": 20261124
+  },
+  "train": {
+    "total_steps": 2000,
+    "warmup_steps": 100,
+    "max_lr": 0.003,
+    "min_lr": 0.0001,
+    "beta1": 0.9,
+    "beta2": 0.95,
+    "eps": 1e-8,
+    "weight_decay": 0.1,
+    "max_grad_norm": 1.0,
+    "eval_interval": 200,
+    "eval_batches": 10,
+    "log_interval": 50,
+    "checkpoint_dir": "checkpoints",
+    "best_checkpoint": "checkpoints/best_tinystories.safetensors",
+    "latest_checkpoint": "checkpoints/latest_tinystories.safetensors",
+    "metrics_path": "checkpoints/metrics_tinystories.json"
+  },
+  "generate": {
+    "checkpoint_path": "checkpoints/best_tinystories.safetensors",
+    "max_new_tokens": 128,
+    "temperature": 0.7,
+    "top_k": 40,
+    "seed": 42,
+    "prompts": [
+      "Once upon a time",
+      "The little girl",
+      "In the forest"
+    ]
+  }
+}
