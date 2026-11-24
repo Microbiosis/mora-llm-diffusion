@@ -80,15 +80,18 @@ mora src/train.mora
 │   │   ├── expert.mora             # 外部冻结专家统一适配器（支持 llama / http / safetensors）
 │   │   ├── external_service.mora   # 基于 std/net/http 的独立外部模型 HTTP 服务 (/v1/predict, /health)
 │   │   ├── prepare_external_expert.mora  # 离线生成备用 SafeTensors 专家权重工具
-│   │   └── pipeline.mora           # 统一可微损失与死区慢可塑性 (emerge_step)、真跳步推理与文本管线
+│   │   ├── pipeline.mora           # 统一可微损失与死区慢可塑性 (emerge_step)、真跳步推理与文本管线
+│   │   └── checkpoint.mora         # CAD-BEBC 系统权重保存 / 加载（21 张量可重载）
 │   ├── config.mora                 # Mini-LLaMA 配置加载（供外部专家预训练与 LatentCodec 共用）
 │   ├── tokenizer.mora              # 纯 Mora UTF-8 字节级分词器（Vocab = 101）
 │   ├── data.mora                   # 语料切分、多批次采样、因果掩码与 RoPE 表
+│   ├── data/corpus.mora             # 字节级语料窗口（张量切片；2MB 语料 2000 窗口 0.1s）
 │   ├── model.mora                  # Mini-LLaMA 模型定义（RoPE + GQA + SwiGLU + 潜空间隐状态接口）
 │   ├── optim.mora                  # Cosine Warmup 调度与 AdamW
 │   ├── checkpoint.mora             # std/nn/safetensors 磁盘权重读写
 │   ├── sampler.mora                # Top-K / Temperature 采样解码
 │   ├── train.mora                  # 外部 Mini-LLaMA 专家离线预训练脚本
+│   ├── train_cad_bebc.mora         # 【主训练入口】CAD-BEBC 架构本体真实语料训练 + 评估 + checkpoint
 │   └── generate.mora               # 外部 Mini-LLaMA 独立对比基线生成脚本
 └── tests/
     ├── tokenizer_test.mora         # 分词器单元测试
