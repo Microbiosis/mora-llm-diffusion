@@ -25,7 +25,7 @@
     "b_rest": -5.5,
     "b_max": 3.0,
     "init_comp_bias": -2.5,
-    "theta_skip": 0.75
+    "theta_skip": 0.62
   },
   "plasticity": {
     "eps_low": 0.08,
@@ -35,9 +35,9 @@
     "temp_s": 0.012,
     "eta_lr": 0.22,
     "lambda_decay": 0.40,
-    "eta_g": 0.012,
+    "eta_g": 0.018,
     "lambda_g": 0.20,
-    "eta_b": 0.25,
+    "eta_b": 0.45,
     "lambda_b": 0.90,
     "eta_conn": 0.04,
     "lambda_conn": 7.0,
