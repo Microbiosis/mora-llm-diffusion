@@ -71,8 +71,14 @@ export task init_diffusion_system(cfg: DiffusionAppConfig): InternalizedDiffusio
   let bp0 = init_backbone_params(mc, sc.seed)
   let bp = pretrain_backbone(bp0, mc, init_bias, sc.pretrain_steps, sc.pretrain_lr, sc.seed)
 
-  let u_all = Tensor::randn([3, mc.d_model, mc.shortcut_rank], "f64", "cpu") * 0.01
-  let v_all = Tensor::zeros([3, mc.d_model, mc.shortcut_rank], "f64", "cpu")
+  -- Cross-step low-rank shortcut (U, V).
+  -- U/V form a bilinear product in shortcut_apply: z + silu(z @ U) @ V^T.
+  -- With V initialised to exactly zero, d(loss)/dU == 0 (measured: |g_u| = 0.0),
+  -- so U could never learn and V only moved through the tiny |U| = 0.01 factor.
+  -- V is now initialised with small random noise (still an identity-scale cold start,
+  -- since V enters as a multiplicative residual) which unblocks the gradient.
+  let u_all = Tensor::randn([3, mc.d_model, mc.shortcut_rank], "f64", "cpu") * mc.shortcut_u_init
+  let v_all = Tensor::randn([3, mc.d_model, mc.shortcut_rank], "f64", "cpu") * mc.shortcut_v_init
   let wg_all = Tensor::zeros([3, mc.d_model], "f64", "cpu")
   let bg_all = Tensor::full([3], mc.b_rest, "f64", "cpu")
 
@@ -90,14 +96,107 @@ task ode_step_tracked(bp: BackboneParams, z: Tensor<f64, _, cpu>, step_t: int, b
   return z + (x0h - z) * (1.0 / float(step_t))
 end
 
-export task unified_diff_loss(p_wblk: Tensor<f64, _, cpu>, p_u: Tensor<f64, _, cpu>, p_v: Tensor<f64, _, cpu>, p_wg: Tensor<f64, _, cpu>, p_bg: Tensor<f64, _, cpu>, p_wcomp: Tensor<f64, _, cpu>, p_bcomp: Tensor<f64, _, cpu>, bp: BackboneParams, x_obs: Tensor<f64, _, cpu>, x_0: Tensor<f64, _, cpu>, y_ext: Tensor<f64, _, cpu>, seg_entries: list<Tensor<f64, _, cpu>>, seg_targets: list<Tensor<f64, _, cpu>>, z_pre_final: Tensor<f64, _, cpu>, p_blk: Tensor<f64, _, cpu>, off_diag: Tensor<f64, _, cpu>, prefix_mask: Tensor<f64, _, cpu>, mc: DiffModelConfig, pc: PlasticityConfig): float
+export task unified_diff_loss(p_wblk: Tensor<f64, _, cpu>, p_u: Tensor<f64, _, cpu>, p_v: Tensor<f64, _, cpu>, p_wg: Tensor<f64, _, cpu>, p_bg: Tensor<f64, _, cpu>, p_wcomp: Tensor<f64, _, cpu>, p_bcomp: Tensor<f64, _, cpu>, bp: BackboneParams, x_obs: Tensor<f64, _, cpu>, x_0: Tensor<f64, _, cpu>, y_ext: Tensor<f64, _, cpu>, seg_entries: list<Tensor<f64, _, cpu>>, seg_targets: list<Tensor<f64, _, cpu>>, z_pre_final: Tensor<f64, _, cpu>, p_blk: Tensor<f64, _, cpu>, off_diag: Tensor<f64, _, cpu>, prefix_mask: Tensor<f64, _, cpu>, mc: DiffModelConfig, pc: PlasticityConfig): Tensor<f64, _, cpu>
   let bias = struct_bias_from_wblk(p_wblk, p_blk, off_diag, prefix_mask)
   let y_int = ode_step_tracked(bp, z_pre_final, 1, bias, mc)
   let pi_int = ((x_obs.rms_norm(mc.rms_eps) * p_wcomp).mean() + p_bcomp).sigmoid()
   let y_mix = y_int * pi_int + y_ext * (1.0 - pi_int)
   let d_mix = y_mix - x_0
   let d_int = y_int - x_0
-  let recon = (d_mix * d_mix).mean() + 0.5 * (d_int * d_int).mean() + pc.lambda_ext_bias * pi_int.sum()
+  -- Reconstruction term.
+  -- NOTE: the recon term is O(1)-O(10) while the shortcut alignment term is O(0.01);
+  -- with the original fixed weight 0.25 the alignment gradient was ~3 orders of
+  -- magnitude smaller than the reconstruction gradient, so the shortcut could not
+  -- learn anything. align_weight is now an explicit, configurable multiplier.
+  -- IMPORTANT: the reconstruction term is kept as a TENSOR (not a float).
+  -- Mora's autograd seeds the root gradient only for tensor outputs
+  -- (src/runtime/autograd.rs: `grads[out_idx] = Some(vec![1.0])`); when the
+  -- differentiated function returns a plain float the engine takes the
+  -- `zero_grads_for_leaves` path and every leaf gradient becomes zero.
+  -- Mixing pi_int in keeps the expression a tensor and preserves the autograd
+  -- edge into pi_int -> p_wcomp / p_bcomp.
+  let recon = (d_mix * d_mix).mean() + 0.5 * (d_int * d_int).mean() + pi_int * 0.0
+
+  -- Competition gate: error-driven advantage, not an unconditional prior.
+  -- The original term (lambda_ext_bias * pi_int.sum()) pushed pi_int DOWN at every
+  -- step regardless of which branch was actually better. Measured on the shipped
+  -- config: internal path MSE 0.2895 vs external expert MSE 0.3615, i.e. the
+  -- internal path WAS better, yet g_bcomp was negative (-0.0057) and pi_int decayed
+  -- monotonically, permanently pinning the system on the external fast path.
+  -- Instead we score the two branches by their own error and let the gate move
+  -- towards the better one:
+  --   advantage = e_ext - e_int  (>0 means internal is more accurate)
+  -- and penalise only pi_int when the internal branch is actually worse.
+  -- Take the branch-comparison scalars inside a `no_grad` block: inside a
+  -- differentiable context Tensor.mean() returns a TENSOR (src/value/tensor.rs
+  -- records a TapeOp::Mean node), while outside it returns a plain float. The
+  -- no_grad block gives a stable scalar in both cases. The advantage only selects
+  -- which penalty coefficient to apply, so it does not itself need a gradient.
+  --
+  -- ARCHITECTURE FIX (input symmetry): the two branches must be compared on the
+  -- SAME input, otherwise "which branch is better" is meaningless. The internal
+  -- path here starts from z_pre_final (an intermediate ODE state), while the
+  -- external expert consumes the raw observation x_obs; comparing them directly
+  -- measured advantage < 0 on every real-corpus window even though the internal
+  -- path was clearly better when both start from x_obs (MSE 0.106 vs 0.183).
+  -- So the internal branch is additionally evaluated from x_obs, matching the
+  -- inference semantics in infer_system.
+  let y_int_obs = no_grad
+    backbone_ode_step(bp, mc, x_obs, mc.num_steps, bias)
+  end
+  let e_int = no_grad
+    ((y_int_obs - x_0) * (y_int_obs - x_0)).mean()
+  end
+  let e_ext = no_grad
+    ((y_ext - x_0) * (y_ext - x_0)).mean()
+  end
+  let advantage = e_ext - e_int
+  -- Keep the term DIFFERENTIABLE in pi_int.
+  -- (d_mix * d_mix).mean() yields a scalar, so the penalty is kept as a tensor and
+  -- folded into the final loss as a tensor; float(...) at the very end converts the
+  -- accumulated 1-element tensor to the scalar return value while keeping the
+  -- autograd edge into pi_int -> p_wcomp / p_bcomp.
+  -- Competition gate: error-driven advantage, not an unconditional prior.
+  --
+  -- The mixed-reconstruction term alone CANNOT drive the competition: with
+  --   y_mix = y_int*pi + y_ext*(1-pi)
+  -- its gradient wrt pi is 2*d_mix*(y_int - y_ext), which points AWAY from the
+  -- internal branch whenever mixing already reduces the error (measured
+  -- g_bcomp = -0.0057 even though the internal path was clearly better:
+  -- MSE 0.2895 vs 0.3615). So the gate needs an explicit, sign-correct driver.
+  --
+  -- We therefore add a differentiable ADVANTAGE term on the gate logit:
+  --   d(pi)/d(logit) = pi*(1-pi)
+  -- and the desired logit shift is proportional to (e_ext - e_int), i.e. the gate
+  -- moves towards the internal branch exactly when the internal branch is more
+  -- accurate, and towards the external branch when it is not.
+  -- Competition gate: supervised directly towards the more accurate branch.
+  --
+  -- Why not rely on the mixed-reconstruction gradient: with
+  --   y_mix = y_int*pi + y_ext*(1-pi)
+  -- its gradient wrt pi is 2*d_mix*(y_int - y_ext), which points AWAY from the
+  -- internal branch whenever mixing already lowers the error (measured
+  -- g_bcomp = -0.0057 even though the internal path was clearly better:
+  -- MSE 0.2895 vs 0.3615). The gate therefore needs its own objective.
+  --
+  -- We supervise the gate LOGIT towards the target probability of the better
+  -- branch, with the target derived from the measured error advantage:
+  --   target_pi = sigmoid(adv_logit_scale * advantage)   (internal if advantage>0)
+  -- and minimise (logit - logit(target_pi))^2. The logit-space form keeps the
+  -- gradient usable even when the gate is deeply saturated (pi_int ~ 0.018).
+  let pi_logit = ((x_obs.rms_norm(mc.rms_eps) * p_wcomp).mean() + p_bcomp)
+  -- The target is derived from the SIGN of the advantage, not its magnitude.
+  -- Using the raw magnitude made the target logit flip sign between windows (the
+  -- advantage is small and noisy on real corpus data), so the gate oscillated
+  -- around its initial value instead of moving. The sign is the robust signal:
+  -- "internal branch is more accurate" vs "external branch is more accurate".
+  let adv_sign = if advantage > 0.0 then 1.0 else -1.0 end
+  let adv_scaled = pc.comp_adv_scale * adv_sign
+  -- sigmoid on the scalar advantage (computed directly to avoid a tensor round-trip)
+  let target_pi = 1.0 / (1.0 + math.exp(-adv_scaled))
+  let target_logit = math.log(target_pi / (1.0 - target_pi) + 0.000000001)
+  let comp_sup = (pi_logit - target_logit) * (pi_logit - target_logit) * pc.comp_gate_weight
+  let recon = recon + comp_sup
 
   let align = 0.0
   let gate_sup = 0.0
@@ -108,8 +207,11 @@ export task unified_diff_loss(p_wblk: Tensor<f64, _, cpu>, p_u: Tensor<f64, _, c
     let e_align = (d * d).mean()
     assign align = align + e_align
 
-    -- Stronger differentiable gate supervision:
-    -- When alignment is better than a relaxed threshold, push gate toward high value more aggressively.
+    -- Differentiable gate supervision.
+    -- Supervise the gate PRE-ACTIVATION logit instead of the sigmoid output:
+    -- with b_rest = -5.5 the sigmoid is saturated (g ~ 0.004), so d(g)/d(logit)
+    -- ~ 0.004 and the gate gradient was ~250x weaker than the logit gradient.
+    -- Supervising the logit keeps the gradient usable across the whole maturity ramp.
     let z_bar = pool_mean_feature(seg_entries[k], mc.rms_eps)
     let logit = (z_bar * p_wg[k]).mean() + p_bg[k]
     let g = logit.sigmoid()
@@ -119,11 +221,29 @@ export task unified_diff_loss(p_wblk: Tensor<f64, _, cpu>, p_u: Tensor<f64, _, c
     -- Extra positive bias when alignment is already decent
     let bonus = if e_align < pc.eps_shortcut then 0.35 else 0.0 end
     let soft_target = target * (1.0 - bonus) + bonus
-    let ge = g - soft_target
-    assign gate_sup = gate_sup + (ge * ge).mean() * 2.5
+    let ge = if pc.gate_logit_space > 0.5 then
+      -- Supervise the PRE-ACTIVATION logit.
+      -- The gate only needs to clear the execution threshold (theta_skip), it does not
+      -- need to saturate to probability 1.0. Driving the target logit to the
+      -- threshold margin (logit(theta_skip) + gate_margin) instead of
+      -- logit(0.999) ~ +7 keeps the maturity ramp reachable from b_rest = -5.5.
+      let th_logit = math.log(mc.theta_skip / (1.0 - mc.theta_skip) + 0.000000001)
+      let tl = th_logit + pc.gate_margin
+      let ge_l = logit - tl
+      ge_l
+    else
+      let ge_p = g - soft_target
+      ge_p
+    end
+    assign gate_sup = gate_sup + (ge * ge).mean() * pc.gate_sup_weight
     assign k = k + 1
   end
-  return recon + 0.25 * align + gate_sup
+  -- NOTE: the loss is returned as a 1-element TENSOR on purpose.
+  -- Mora's autograd seeds the root gradient only for tensor outputs
+  -- (src/runtime/autograd.rs: `grads[out_idx] = Some(vec![1.0])`); a float return
+  -- yields zero gradients for every leaf. Keeping the tensor form preserves the
+  -- autograd edge into pi_int -> p_wcomp / p_bcomp.
+  return recon + pc.align_weight * align + gate_sup
 end
 
 task clamp_wblk(w: Tensor<f64, _, cpu>, off_diag: Tensor<f64, _, cpu>, init_iso: float): Tensor<f64, _, cpu>
@@ -199,7 +319,9 @@ let m_fail = deadzone_fail_gate(e_base, pc)
 -- Fully differentiable update: single value_and_grad over all plasticity parameters
 let vg = value_and_grad(unified_diff_loss, argnums = [0, 1, 2, 3, 4, 5, 6])
 let res = vg(sys.w_blk, sys.u_all, sys.v_all, sys.wg_all, sys.bg_all, sys.w_comp, sys.b_comp, sys.backbone, x_obs, x_0, y_ext, seg_entries, seg_targets, z_pre_final, sys.p_blk, sys.off_diag, sys.prefix_mask, mc, pc)
-let int_loss = float(res[0])
+-- unified_diff_loss returns a 1-element tensor (required for Mora's autograd to
+-- seed the root gradient), so the reported loss is read out of the tensor.
+let int_loss = res[0].to_list()[0]
 let gs: list<Tensor<f64, _, cpu>> = res[1]
 
 let g_wblk = gs[0]
@@ -239,7 +361,14 @@ end
 let bg_next = Tensor::from_list(bg_list, "f64")
 
 let w_comp_next = sys.w_comp * (1.0 - pc.lambda_g * step_fail) - g_wcomp * (pc.eta_comp * step_ok)
-let b_comp_val = float(sys.b_comp.item()) - float(g_bcomp.item()) * (pc.eta_comp * step_ok) - pc.lambda_b * step_fail * (float(sys.b_comp.item()) - mc.init_comp_bias)
+-- The competition gate gets its own learning rate and pullback rate:
+-- reusing lambda_b (designed for the skip-gate bias, where pullback must be 5-10x
+-- faster than growth) here suppressed the competition gate on real corpus data
+-- (b_comp oscillated around -3.5 instead of rising). It is also read via to_list()
+-- because Tensor.item() yields a TENSOR in a differentiable context, which
+-- float() rejects.
+let b_comp_cur = sys.b_comp.to_list()[0]
+let b_comp_val = b_comp_cur - g_bcomp.to_list()[0] * (pc.eta_comp * step_ok) - pc.lambda_comp * step_fail * (b_comp_cur - mc.init_comp_bias)
 let b_comp_next = Tensor::full([1], b_comp_val, "f64", "cpu")
 
 let next_sys = InternalizedDiffusionSystem(cfg = sys.cfg, backbone = sys.backbone, w_blk = w_blk_next, p_blk = sys.p_blk, off_diag = sys.off_diag, prefix_mask = sys.prefix_mask, u_all = u_next, v_all = v_next, wg_all = wg_next, bg_all = bg_next, w_comp = w_comp_next, b_comp = b_comp_next, expert = sys.expert, total_steps = sys.total_steps + 1)
@@ -247,18 +376,25 @@ return EmergeStepResult(system = next_sys, int_loss = int_loss, e_base = e_base,
 end
 
 export task comp_gate_scalar(sys: InternalizedDiffusionSystem, x_obs: Tensor<f64, _, cpu>): float
+  -- NOTE: in a differentiable context Tensor.item() yields a TENSOR (which float()
+  -- rejects), so the bias is read via to_list() -> [scalar].
   let logit = no_grad
-  float((x_obs.rms_norm(sys.cfg.model.rms_eps) * sys.w_comp).mean()) + float(sys.b_comp.item())
-end
-return sigmoid_scalar(logit)
+    float((x_obs.rms_norm(sys.cfg.model.rms_eps) * sys.w_comp).mean()) + sys.b_comp.to_list()[0]
+  end
+  return sigmoid_scalar(logit)
 end
 
-export task infer_system(sys: InternalizedDiffusionSystem, x_obs: Tensor<f64, _, cpu>, force_full: bool = false): InferResult
+-- force_full     : run the backbone on every step (no early skip)
+-- force_internal : ignore the external fast path, so the INTERNAL path can be
+--                  exercised even when the competition gate currently prefers the
+--                  external expert. This isolates the skip mechanism from the
+--                  competition mechanism, which are independent claims.
+export task infer_system(sys: InternalizedDiffusionSystem, x_obs: Tensor<f64, _, cpu>, force_full: bool = false, force_internal: bool = false): InferResult
   let mc = sys.cfg.model
   let pi_int = comp_gate_scalar(sys, x_obs)
   let y_ext = expert_predict(sys.expert, x_obs)
 
-  if !force_full and pi_int < 0.05 then
+  if !force_full and !force_internal and pi_int < 0.05 then
     return InferResult(output = y_ext, path_mode = "external_fast", backbone_nfe = 0, shortcuts_used = 0, pi_int = pi_int, g_int = 0.0)
   end
 

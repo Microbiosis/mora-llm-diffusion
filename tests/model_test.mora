@@ -6,15 +6,24 @@ import "src/model.mora"
 import "src/optim.mora"
 
 export task test_const_generic_blocks()
+  -- The hard-coded 32-d build_default_block helper was removed in commit f488fc1
+  -- ("model: remove hard-coded 32-d build_default_block helper"), which left this
+  -- test referencing a symbol that no longer exists.
+  --
+  -- The property this test guards is "a configured multi-layer block stack
+  -- produces a correctly shaped hidden state". That is exercised through the
+  -- public parameter-bundle path (init_model_params + forward_hidden_from_latent),
+  -- which is the same const-generic block machinery used by the training loop and
+  -- is covered by the causality and autograd tests below.
   random.seed(123)
-  let x = Tensor::randn([2, 6, 32], "f64", "cpu")
+  let cfg = ModelConfig(vocab_size = 16, seq_len = 6, n_layers = 2, d_model = 32, n_q_heads = 4, n_kv_heads = 2, head_dim = 8, ffn_hidden = 64, rms_eps = 0.00001, rope_theta = 10000.0, init_scale = 0.1)
+  let p = init_model_params(cfg, 123)
   let mask = build_causal_mask(6)
   let rope = build_rope_tables(6, 8, 10000.0)
   let rot_j = build_rope_rot_matrix()
 
-  let block = build_default_block(Tensor::randn([32, 32], "f64", "cpu") * 0.1, Tensor::randn([32, 16], "f64", "cpu") * 0.1, Tensor::randn([32, 16], "f64", "cpu") * 0.1, Tensor::randn([32, 32], "f64", "cpu") * 0.1, Tensor::randn([32, 64], "f64", "cpu") * 0.1, Tensor::randn([32, 64], "f64", "cpu") * 0.1, Tensor::randn([64, 32], "f64", "cpu") * 0.1, Tensor::ones([32], "f64", "cpu"), Tensor::ones([32], "f64", "cpu"))
-
-  let y: Tensor<f64, [2, 6, 32], cpu> = block.forward(x, mask, rope[0], rope[1], rot_j, 0.00001)
+  let x = Tensor::randn([2, 6, 32], "f64", "cpu")
+  let y = forward_hidden_from_latent(p.wq, p.wk, p.wv, p.wo, p.w_gate, p.w_up, p.w_down, p.attn_norm, p.ffn_norm, p.final_norm, x, mask, rope[0], rope[1], rot_j, cfg.n_layers, cfg.n_q_heads, cfg.n_kv_heads, cfg.head_dim, cfg.rms_eps)
   assert_eq(y.shape(), [2, 6, 32])
 end
 

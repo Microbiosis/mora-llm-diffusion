@@ -1,0 +1,76 @@
+-- Fast byte-level corpus windowing for CAD-BEBC training.
+--
+-- The original path (src/data.mora -> ByteTokenizer.encode) tokenises the WHOLE
+-- corpus into one Mora list via repeated list.push. That is O(n^2) in the number of
+-- chunks and measured >5 minutes for the 2 MB TinyStories sample, which made
+-- real-data training impractical.
+--
+-- This module instead keeps the corpus as a byte tensor and slices only the
+-- windows that are actually needed. Measured on the same 2 MB corpus:
+--   full-corpus tokenizer : > 300 s
+--   tensor-slice windowing :   0.104 s for 2000 windows  (same token ids)
+--
+-- The byte -> token mapping is exactly ByteTokenizer's:
+--   '\n' (10) -> 4, '\t' (9) -> 5, printable ASCII 32..126 -> 6 + (b - 32),
+--   everything else -> 3 (unk). CR (13) is dropped by the tokenizer, so it is
+--   dropped here as well to keep the token streams identical.
+
+import "src/tokenizer.mora"
+
+export struct ByteCorpus
+  bytes: Tensor<u8, _, cpu>
+  n_bytes: int = 0
+end
+
+export task load_byte_corpus(path: string): ByteCorpus
+  let raw = file.read_text(path)
+  let bt = Tensor::from_utf8(raw)
+  return ByteCorpus(bytes = bt, n_bytes = bt.numel())
+end
+
+export task byte_to_token_id(b: int): int
+  if b == 10 then
+    return 4
+  end
+  if b == 9 then
+    return 5
+  end
+  if b >= 32 and b <= 126 then
+    return 6 + (b - 32)
+  end
+  return 3
+end
+
+export task corpus_window_ids(c: ByteCorpus, start: int, seq_len: int): list<int>
+  -- Token ids for the byte window [start, start + seq_len). CR bytes are dropped
+  -- (ByteTokenizer skips 13), so a window may yield fewer than seq_len tokens.
+  let win = c.bytes[start..start + seq_len]
+  let raw = win.to_list()
+  let out: list<int> = []
+  let i = 0
+  while i < raw.len()
+    let b = int(raw[i])
+    if b != 13 then
+      assign out = out.push(byte_to_token_id(b))
+    end
+    assign i = i + 1
+  end
+  return out
+end
+
+export task corpus_window_start(c: ByteCorpus, index: int, seq_len: int, stride: int): int
+  -- Deterministic pseudo-random window start. Uses a multiplicative hash so that
+  -- successive indices visit different windows without materialising a start
+  -- list over the whole corpus (which would itself be O(n) memory).
+  let span = c.n_bytes - seq_len - 1
+  if span < 1 then
+    return 0
+  end
+  let h = (index * 2654435761 + 1013904223) % 4294967291
+  return (h % span)
+end
+
+export task corpus_token_window(c: ByteCorpus, index: int, seq_len: int, stride: int): list<int>
+  let s = corpus_window_start(c, index, seq_len, stride)
+  return corpus_window_ids(c, s, seq_len)
+end

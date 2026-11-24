@@ -1,6 +1,7 @@
 # Runtime & build artifacts
 checkpoints/*.safetensors
 checkpoints/metrics.json
+checkpoints/cad_bebc_metrics.json
 *.morac
 *.exe
 vendor/

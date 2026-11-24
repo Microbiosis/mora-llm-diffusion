@@ -23,11 +23,13 @@ export struct DiffModelConfig
   rms_eps: float = 0.00001
   num_steps: int = 8
   shortcut_rank: int = 8
-  init_iso: float = 4.0
-  b_rest: float = -4.5
-  b_max: float = 3.5
-  init_comp_bias: float = -2.5
-  theta_skip: float = 0.85
+  init_iso: float = 2.0
+  b_rest: float = -5.5
+  b_max: float = 3.0
+  init_comp_bias: float = -4.0
+  theta_skip: float = 0.62
+  shortcut_u_init: float = 0.5
+  shortcut_v_init: float = 0.01
 end
 
 export struct PlasticityConfig
@@ -40,12 +42,19 @@ export struct PlasticityConfig
   lambda_decay: float = 0.15
   eta_g: float = 0.02
   lambda_g: float = 0.08
-  eta_b: float = 0.06
-  lambda_b: float = 0.48
+  eta_b: float = 0.08
+  lambda_b: float = 0.6
   eta_conn: float = 0.5
   lambda_conn: float = 2.5
   eta_comp: float = 0.6
   lambda_ext_bias: float = 0.001
+  align_weight: float = 0.25
+  gate_sup_weight: float = 0.03
+  gate_logit_space: float = 1.0
+  gate_margin: float = 1.0
+  comp_gate_weight: float = 0.5
+  comp_adv_scale: float = 4.0
+  lambda_comp: float = 0.05
 end
 
 export struct ScheduleConfig
@@ -109,8 +118,8 @@ export task load_diffusion_config(path: string = "config/diffusion.json"): Diffu
   let s = dcfg_dict(root, "schedule")
 
   let ec = ExternalExpertConfig(mode = dcfg_str(e, "mode", "llama"), http_addr = dcfg_str(e, "http_addr", "127.0.0.1:18080"), http_path = dcfg_str(e, "http_path", "/v1/predict"), model_name = dcfg_str(e, "model_name", "mini-llama-frozen-v1"), timeout_ms = dcfg_int(e, "timeout_ms", 3000), checkpoint_path = dcfg_str(e, "checkpoint_path", "models/external_expert.safetensors"), llama_checkpoint_path = dcfg_str(e, "llama_checkpoint_path", "models/mini_llama_frozen.safetensors"))
-  let mc = DiffModelConfig(architecture = arch, n_layers = dcfg_int(m, "n_layers", 2), num_blocks = dcfg_int(m, "num_blocks", 4), block_size = dcfg_int(m, "block_size", 4), prefix_blocks = dcfg_int(m, "prefix_blocks", 2), d_model = dcfg_int(m, "d_model", 32), n_heads = dcfg_int(m, "n_heads", 4), head_dim = dcfg_int(m, "head_dim", 8), ffn_hidden = dcfg_int(m, "ffn_hidden", 64), rms_eps = dcfg_float(m, "rms_eps", 0.00001), num_steps = dcfg_int(m, "num_steps", 8), shortcut_rank = dcfg_int(m, "shortcut_rank", 8), init_iso = dcfg_float(m, "init_iso", 4.0), b_rest = dcfg_float(m, "b_rest", -4.5), b_max = dcfg_float(m, "b_max", 3.5), init_comp_bias = dcfg_float(m, "init_comp_bias", -2.5), theta_skip = dcfg_float(m, "theta_skip", 0.85))
-  let pc = PlasticityConfig(eps_low = dcfg_float(p, "eps_low", 0.11), eps_high = dcfg_float(p, "eps_high", 0.23), temp_e = dcfg_float(p, "temp_e", 0.015), eps_shortcut = dcfg_float(p, "eps_shortcut", 0.14), temp_s = dcfg_float(p, "temp_s", 0.015), eta_lr = dcfg_float(p, "eta_lr", 0.5), lambda_decay = dcfg_float(p, "lambda_decay", 0.15), eta_g = dcfg_float(p, "eta_g", 0.02), lambda_g = dcfg_float(p, "lambda_g", 0.08), eta_b = dcfg_float(p, "eta_b", 0.06), lambda_b = dcfg_float(p, "lambda_b", 0.48), eta_conn = dcfg_float(p, "eta_conn", 0.5), lambda_conn = dcfg_float(p, "lambda_conn", 2.5), eta_comp = dcfg_float(p, "eta_comp", 0.6), lambda_ext_bias = dcfg_float(p, "lambda_ext_bias", 0.001))
+  let mc = DiffModelConfig(architecture = arch, n_layers = dcfg_int(m, "n_layers", 2), num_blocks = dcfg_int(m, "num_blocks", 4), block_size = dcfg_int(m, "block_size", 4), prefix_blocks = dcfg_int(m, "prefix_blocks", 2), d_model = dcfg_int(m, "d_model", 32), n_heads = dcfg_int(m, "n_heads", 4), head_dim = dcfg_int(m, "head_dim", 8), ffn_hidden = dcfg_int(m, "ffn_hidden", 64), rms_eps = dcfg_float(m, "rms_eps", 0.00001), num_steps = dcfg_int(m, "num_steps", 8), shortcut_rank = dcfg_int(m, "shortcut_rank", 8), init_iso = dcfg_float(m, "init_iso", 2.0), b_rest = dcfg_float(m, "b_rest", -5.5), b_max = dcfg_float(m, "b_max", 3.0), init_comp_bias = dcfg_float(m, "init_comp_bias", -4.0), theta_skip = dcfg_float(m, "theta_skip", 0.62), shortcut_u_init = dcfg_float(m, "shortcut_u_init", 0.5), shortcut_v_init = dcfg_float(m, "shortcut_v_init", 0.01))
+  let pc = PlasticityConfig(eps_low = dcfg_float(p, "eps_low", 0.11), eps_high = dcfg_float(p, "eps_high", 0.23), temp_e = dcfg_float(p, "temp_e", 0.015), eps_shortcut = dcfg_float(p, "eps_shortcut", 0.14), temp_s = dcfg_float(p, "temp_s", 0.015), eta_lr = dcfg_float(p, "eta_lr", 0.5), lambda_decay = dcfg_float(p, "lambda_decay", 0.15), eta_g = dcfg_float(p, "eta_g", 0.02), lambda_g = dcfg_float(p, "lambda_g", 0.08), eta_b = dcfg_float(p, "eta_b", 0.08), lambda_b = dcfg_float(p, "lambda_b", 0.6), eta_conn = dcfg_float(p, "eta_conn", 0.5), lambda_conn = dcfg_float(p, "lambda_conn", 2.5), eta_comp = dcfg_float(p, "eta_comp", 0.6), lambda_ext_bias = dcfg_float(p, "lambda_ext_bias", 0.001), align_weight = dcfg_float(p, "align_weight", 0.25), gate_sup_weight = dcfg_float(p, "gate_sup_weight", 0.03), gate_logit_space = dcfg_float(p, "gate_logit_space", 1.0), gate_margin = dcfg_float(p, "gate_margin", 1.0), comp_gate_weight = dcfg_float(p, "comp_gate_weight", 0.5), comp_adv_scale = dcfg_float(p, "comp_adv_scale", 4.0), lambda_comp = dcfg_float(p, "lambda_comp", 0.05))
   let sc = ScheduleConfig(pretrain_steps = dcfg_int(s, "pretrain_steps", 140), pretrain_lr = dcfg_float(s, "pretrain_lr", 0.03), cold_start_steps = dcfg_int(s, "cold_start_steps", 15), consolidation_steps = dcfg_int(s, "consolidation_steps", 260), mature_eval_steps = dcfg_int(s, "mature_eval_steps", 30), ood_adapt_steps = dcfg_int(s, "ood_adapt_steps", 60), seed = dcfg_int(s, "seed", 20261123))
 
   return DiffusionAppConfig(architecture = arch, external_expert = ec, model = mc, plasticity = pc, schedule = sc)

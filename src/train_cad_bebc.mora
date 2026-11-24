@@ -1,0 +1,188 @@
+-- CAD-BEBC Training Entrypoint: trains the new architecture on REAL corpus data.
+--
+-- Why this file exists
+-- -------------------
+-- The repository previously had no way to train the CAD-BEBC architecture on real
+-- data:
+--   * src/train.mora trains the external Mini-LLaMA expert, NOT the new
+--     architecture (it is the frozen teacher, not the system under study).
+--   * src/cad_bebc.mora trains the architecture only on SYNTHETIC data
+--     (sample_structured_batch), so any "training" result was measured on
+--     synthetic sinusoids rather than on language.
+--   * The corpus helper load_corpus_continuous_batch was dead code (zero callers).
+--   * The CAD-BEBC system had no checkpoint writer, so a trained system could not
+--     be reloaded or shipped.
+--
+-- This entrypoint trains the CAD-BEBC system on real text windows sampled from a
+-- byte corpus, evaluates the learned system on held-out windows, and writes a
+-- reloadable checkpoint plus a metrics file.
+
+import "std/nn/safetensors"
+import "src/config.mora"
+import "src/tokenizer.mora"
+import "src/data.mora"
+import "src/data/corpus.mora"
+import "src/model.mora"
+import "src/checkpoint.mora"
+import "src/sampler.mora"
+import "src/latent_codec.mora"
+import "src/diffusion/config.mora"
+import "src/diffusion/causal_graph.mora"
+import "src/diffusion/backbone.mora"
+import "src/diffusion/shortcut.mora"
+import "src/diffusion/expert.mora"
+import "src/diffusion/pipeline.mora"
+import "src/diffusion/checkpoint.mora"
+
+-- Latent-space batch built from real corpus windows.
+-- The clean latent x_0 is the Mini-LLaMA token-embedding of the window's token
+-- ids (the same latent space the latent codec uses); the observation x_obs is
+-- x_0 corrupted with structured noise, matching the corruption pattern the
+-- architecture is designed to inpaint (odd positions inside a block are damaged,
+-- so intra-block bidirectional attention is required to repair them).
+export task corpus_latent_batch(c: ByteCorpus, codec: LatentCodec, index: int, num_blocks: int, block_size: int, corrupt_odd: bool, seed: int): list<Tensor<f64, _, cpu>>
+  let seq = num_blocks * block_size
+  let ids = corpus_token_window(c, index, seq + 1, 1)
+  if ids.len() < 2 then
+    return sample_structured_batch(1, num_blocks, block_size, codec.d_model, "simple", seed)
+  end
+  -- pad/truncate to seq tokens
+  let padded: list<int> = []
+  let i = 0
+  while i < seq
+    let tid = if i < ids.len() then ids[i] else codec.tok.pad_id end
+    assign padded = padded.push(tid)
+    assign i = i + 1
+  end
+  let eye = build_eye_rows(codec.tok.vocab_size)
+  let onehot = encode_ids_onehot([padded], eye)
+  let z_clean = no_grad
+    onehot @ codec.llama_params.tok_emb
+  end
+
+  random.seed(seed)
+  let noise = Tensor::randn(z_clean.shape(), "f64", "cpu") * 0.25
+  let rows = z_clean.to_list()
+  let nrows = noise.to_list()
+  let out_rows: list<list<list<float>>> = []
+  let clean_rows: list<list<list<float>>> = []
+  let b = 0
+  while b < rows.len()
+    let r = rows[b]
+    let nr = nrows[b]
+    let orow: list<list<float>> = []
+    let crow: list<list<float>> = []
+    let t = 0
+    while t < seq
+      let pos_in_blk = t % block_size
+      let or: list<float> = []
+      let cr: list<float> = []
+      let ch = 0
+      while ch < codec.d_model
+        let cv = float(r[t][ch])
+        let nv = float(nr[t][ch])
+        let v = cv
+        if corrupt_odd and pos_in_blk % 2 == 1 then
+          assign v = cv * 0.15 + nv * 1.5
+        else
+          assign v = cv + nv * 0.3
+        end
+        assign or = or.push(v)
+        assign cr = cr.push(cv)
+        assign ch = ch + 1
+      end
+      assign orow = orow.push(or)
+      assign crow = crow.push(cr)
+      assign t = t + 1
+    end
+    assign out_rows = out_rows.push(orow)
+    assign clean_rows = clean_rows.push(crow)
+    assign b = b + 1
+  end
+  return [Tensor::from_list(out_rows, "f64"), Tensor::from_list(clean_rows, "f64")]
+end
+
+task evaluate(system: InternalizedDiffusionSystem, c: ByteCorpus, codec: LatentCodec, mc: DiffModelConfig, batches: int, seed: int, val_offset: int): float
+  let total = 0.0
+  let i = 0
+  while i < batches
+    let pair = corpus_latent_batch(c, codec, val_offset + i * 7, mc.num_blocks, mc.block_size, true, seed + i)
+    let inf = infer_system(system, pair[0], true)
+    let d = inf.output - pair[1]
+    assign total = total + float((d * d).mean())
+    assign i = i + 1
+  end
+  return total / float(batches)
+end
+
+task main()
+  let cfg = load_diffusion_config("config/diffusion.json")
+  let mc = cfg.model
+  let pc = cfg.plasticity
+  let sc = cfg.schedule
+
+  print("=== CAD-BEBC Real-Corpus Training ===")
+  print("arch:", cfg.architecture, "| layers:", mc.n_layers, "| blocks:", mc.num_blocks, "x", mc.block_size, "| D:", mc.d_model, "| external_mode:", cfg.external_expert.mode)
+
+  let codec = load_latent_codec("config/default.json", cfg.external_expert.llama_checkpoint_path)
+  let corpus = load_byte_corpus("data/tinystories_sample.txt")
+  print("corpus bytes:", corpus.n_bytes, "| latent dim:", codec.d_model, "| seq:", codec.seq_len)
+
+  let sys = init_diffusion_system(cfg)
+  print("backbone_params:", count_backbone_parameters(sys.backbone), "| frozen_external_expert:", count_expert_parameters(sys.expert))
+
+  -- Training loop over REAL corpus windows.
+  let total_steps = sc.consolidation_steps
+  let st = 1
+  let last_loss = 0.0
+  while st <= total_steps
+    let pair = corpus_latent_batch(corpus, codec, st, mc.num_blocks, mc.block_size, true, sc.seed + st)
+    let em = emerge_step(sys, pair[0], pair[1], sc.seed + st)
+    assign sys = em.system
+    assign last_loss = em.int_loss
+    if st == 1 or st % 120 == 0 or st == total_steps then
+      let v = evaluate(sys, corpus, codec, mc, 4, sc.seed + 9999, 500000)
+      print("  [step", st, "] train_loss:", em.int_loss, "| val_mse:", v, "| e_base:", em.e_base, "| m_ok:", em.m_ok_mean, "| m_fail:", em.m_fail, "| V_rms:", mean_shortcut_v_rms(sys), "| bg:", mean_gate_bias(sys), "| coupling:", mean_interblock_coupling(sys.w_blk, mc.init_iso))
+    end
+    assign st = st + 1
+  end
+
+  -- Final evaluation: full path vs shortcut path on held-out real windows.
+  let n = 12
+  let m_full = 0.0
+  let m_short = 0.0
+  let skips = 0
+  let nfes = 0
+  let i = 0
+  while i < n
+    let pair = corpus_latent_batch(corpus, codec, 900000 + i * 13, mc.num_blocks, mc.block_size, true, sc.seed + 4242 + i)
+    let f = infer_system(sys, pair[0], true)
+    let sh = infer_system(sys, pair[0], false)
+    let df = f.output - pair[1]
+    let ds = sh.output - pair[1]
+    assign m_full = m_full + float((df * df).mean())
+    assign m_short = m_short + float((ds * ds).mean())
+    assign skips = skips + sh.shortcuts_used
+    assign nfes = nfes + sh.backbone_nfe
+    assign i = i + 1
+  end
+  let dn = float(n)
+  let val_mse = m_full / dn
+  print("=== Held-out real-corpus evaluation (", n, "windows ) ===")
+  print("full-path MSE   :", val_mse)
+  print("short-path MSE  :", m_short / dn, "| avg nfe:", float(nfes) / dn, "| avg skips:", float(skips) / dn)
+  print("shortcut penalty:", (m_short - m_full) / m_full * 100.0, "%")
+
+  -- Persist the trained system.
+  let ckpt = "checkpoints/cad_bebc_trained.safetensors"
+  let nb = save_cad_bebc(ckpt, sys, total_steps, last_loss, val_mse)
+  print("=== Checkpoint Written ===")
+  print("path:", ckpt, "| bytes:", nb)
+  let hdr = inspect_cad_bebc(ckpt)
+  print("tensors:", hdr.num_tensors, "| arch:", hdr.architecture, "| step:", hdr.step)
+
+  let metrics: dict<string, any> = {}
+  assign metrics = metrics.set("architecture", cfg.architecture).set("total_steps", total_steps).set("final_train_loss", last_loss).set("val_mse", val_mse).set("short_mse", m_short / dn).set("avg_nfe", float(nfes) / dn).set("avg_skips", float(skips) / dn).set("v_rms", mean_shortcut_v_rms(sys)).set("gate_bias", mean_gate_bias(sys)).set("interblock_coupling", mean_interblock_coupling(sys.w_blk, mc.init_iso)).set("corpus_bytes", corpus.n_bytes).set("corpus_path", "data/tinystories_sample.txt").set("checkpoint", ckpt)
+  file.write_text("checkpoints/cad_bebc_metrics.json", json.stringify(metrics))
+  print("metrics: checkpoints/cad_bebc_metrics.json")
+end

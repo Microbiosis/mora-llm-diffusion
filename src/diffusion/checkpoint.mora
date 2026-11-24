@@ -1,0 +1,109 @@
+-- CAD-BEBC System Checkpointing: persist the full internalized diffusion system.
+--
+-- The Mini-LLaMA checkpoint in src/checkpoint.mora only covers the external expert.
+-- The CAD-BEBC system itself owns three distinct groups of learned state that must
+-- survive a training run:
+--   1. the diffusion backbone (14 tensors),
+--   2. the inter-block causal structure W_blk,
+--   3. the plasticity state (U, V, w_g, b_g, comp gate w_comp / b_comp).
+-- Without this module a trained CAD-BEBC system cannot be reloaded, shipped to the
+-- Hub, or evaluated independently, which makes "train the new architecture" a
+-- one-shot process with no deliverable artifact.
+
+import "std/nn/safetensors"
+import "src/diffusion/config.mora"
+import "src/diffusion/causal_graph.mora"
+import "src/diffusion/backbone.mora"
+import "src/diffusion/shortcut.mora"
+import "src/diffusion/expert.mora"
+import "src/diffusion/pipeline.mora"
+
+export struct CadBebcCheckpointHeader
+  path: string = ""
+  num_tensors: int = 0
+  bytes: int = 0
+  architecture: string = ""
+  step: int = 0
+end
+
+task cad_ensure_parent(path: string)
+  let dir = file.dirname(path)
+  if dir != "" and !file.exists(dir) then
+    file.mkdir_all(dir)
+  end
+end
+
+export task save_cad_bebc(path: string, sys: InternalizedDiffusionSystem, step: int, train_loss: float, val_loss: float): int
+  cad_ensure_parent(path)
+  let bp = sys.backbone
+  let tensors: dict<string, any> = {}
+  assign tensors = tensors.set("backbone.in_proj.weight", bp.in_proj)
+  assign tensors = tensors.set("backbone.pos_emb.weight", bp.pos_emb)
+  assign tensors = tensors.set("backbone.time_proj.weight", bp.time_proj)
+  assign tensors = tensors.set("backbone.attn_norm.weight", bp.attn_norm)
+  assign tensors = tensors.set("backbone.wq.weight", bp.wq)
+  assign tensors = tensors.set("backbone.wk.weight", bp.wk)
+  assign tensors = tensors.set("backbone.wv.weight", bp.wv)
+  assign tensors = tensors.set("backbone.wo.weight", bp.wo)
+  assign tensors = tensors.set("backbone.ffn_norm.weight", bp.ffn_norm)
+  assign tensors = tensors.set("backbone.w_gate.weight", bp.w_gate)
+  assign tensors = tensors.set("backbone.w_up.weight", bp.w_up)
+  assign tensors = tensors.set("backbone.w_down.weight", bp.w_down)
+  assign tensors = tensors.set("backbone.out_norm.weight", bp.out_norm)
+  assign tensors = tensors.set("backbone.out_proj.weight", bp.out_proj)
+  assign tensors = tensors.set("plasticity.w_blk", sys.w_blk)
+  assign tensors = tensors.set("plasticity.u_all", sys.u_all)
+  assign tensors = tensors.set("plasticity.v_all", sys.v_all)
+  assign tensors = tensors.set("plasticity.wg_all", sys.wg_all)
+  assign tensors = tensors.set("plasticity.bg_all", sys.bg_all)
+  assign tensors = tensors.set("plasticity.w_comp", sys.w_comp)
+  assign tensors = tensors.set("plasticity.b_comp", sys.b_comp)
+
+  let mc = sys.cfg.model
+  let meta: dict<string, string> = {"architecture": sys.cfg.architecture, "mora_version": "0.111.0", "n_layers": str(mc.n_layers), "d_model": str(mc.d_model), "num_blocks": str(mc.num_blocks), "block_size": str(mc.block_size), "prefix_blocks": str(mc.prefix_blocks), "shortcut_rank": str(mc.shortcut_rank), "init_iso": str(mc.init_iso), "b_rest": str(mc.b_rest), "b_max": str(mc.b_max), "init_comp_bias": str(mc.init_comp_bias), "theta_skip": str(mc.theta_skip), "step": str(step), "train_loss": str(train_loss), "val_loss": str(val_loss), "total_steps": str(sys.total_steps)}
+  let res = safetensors_save(path, tensors, meta)
+  return match res with
+      SafetensorsResult::Ok(nbytes) -> nbytes
+      SafetensorsResult::Err(_) -> 0
+    end
+  end
+
+task cad_req_tensor(ts: dict<string, any>, name: string): Tensor<f64, _, cpu>
+  let t = ts.get(name)
+  assert(type_of(t) == "tensor", "missing CAD-BEBC tensor: " + name)
+  return t.contiguous()
+end
+
+export task load_cad_bebc(path: string, cfg: DiffusionAppConfig, device: string = "cpu"): InternalizedDiffusionSystem
+  let res = safetensors_load(path, device)
+  let sf: SafetensorsFile = match res with
+      SafetensorsResult::Ok(f) -> f
+      SafetensorsResult::Err(_) -> SafetensorsFile(metadata = {}, headers = {}, tensors = {})
+    end
+  assert(sf.tensors.len() > 0, "failed to load CAD-BEBC SafeTensors checkpoint: " + path)
+  let ts = sf.tensors
+  let mc = cfg.model
+
+  let bp = BackboneParams(in_proj = cad_req_tensor(ts, "backbone.in_proj.weight"), pos_emb = cad_req_tensor(ts, "backbone.pos_emb.weight"), time_proj = cad_req_tensor(ts, "backbone.time_proj.weight"), attn_norm = cad_req_tensor(ts, "backbone.attn_norm.weight"), wq = cad_req_tensor(ts, "backbone.wq.weight"), wk = cad_req_tensor(ts, "backbone.wk.weight"), wv = cad_req_tensor(ts, "backbone.wv.weight"), wo = cad_req_tensor(ts, "backbone.wo.weight"), ffn_norm = cad_req_tensor(ts, "backbone.ffn_norm.weight"), w_gate = cad_req_tensor(ts, "backbone.w_gate.weight"), w_up = cad_req_tensor(ts, "backbone.w_up.weight"), w_down = cad_req_tensor(ts, "backbone.w_down.weight"), out_norm = cad_req_tensor(ts, "backbone.out_norm.weight"), out_proj = cad_req_tensor(ts, "backbone.out_proj.weight"))
+
+  let p_blk = build_block_projection(mc.num_blocks, mc.block_size)
+  let off_diag = build_off_diag_mask(mc.num_blocks)
+  let prefix_mask = build_prefix_causal_mask(mc.num_blocks, mc.block_size, mc.prefix_blocks)
+  let exp = load_external_expert(cfg.external_expert, mc.rms_eps, device)
+
+  let step_v = sf.metadata.get("step")
+  let step_num = if step_v == nil then 0 else int(str(step_v)) end
+
+  return InternalizedDiffusionSystem(cfg = cfg, backbone = bp, w_blk = cad_req_tensor(ts, "plasticity.w_blk"), p_blk = p_blk, off_diag = off_diag, prefix_mask = prefix_mask, u_all = cad_req_tensor(ts, "plasticity.u_all"), v_all = cad_req_tensor(ts, "plasticity.v_all"), wg_all = cad_req_tensor(ts, "plasticity.wg_all"), bg_all = cad_req_tensor(ts, "plasticity.bg_all"), w_comp = cad_req_tensor(ts, "plasticity.w_comp"), b_comp = cad_req_tensor(ts, "plasticity.b_comp"), expert = exp, total_steps = step_num)
+end
+
+export task inspect_cad_bebc(path: string): CadBebcCheckpointHeader
+  let res = safetensors_inspect(path)
+  let hdr = match res with
+      SafetensorsResult::Ok(h) -> h
+      SafetensorsResult::Err(_) -> SafetensorsHeader(header_len = 0, data_offset = 8, metadata = {}, tensors = {})
+    end
+  let step_v = hdr.metadata.get("step")
+  let arch_v = hdr.metadata.get("architecture")
+  return CadBebcCheckpointHeader(path = path, num_tensors = hdr.tensors.len(), bytes = hdr.header_len, architecture = if arch_v == nil then "" else str(arch_v) end, step = if step_v == nil then 0 else int(str(step_v)) end)
+end
