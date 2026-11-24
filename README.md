@@ -1,6 +1,6 @@
 # mora-llm-diffusion (CAD-BEBC)
 
-基于 **Mora v0.111.0** 语言工具链实现的 **CAD-BEBC（连续自回归扩散块外双向因果架构）** 统一系统：以连续潜空间块扩散为主干，整合**块内双向 + 块外可微双向因果 $W_{\text{blk}}$ + 前缀因果顺序**，融合反向传播梯度与死区软门（`m_ok / m_fail` + 静息偏置 `b_rest`），由权重自身缓慢演进自然涌现跨步低秩短通路、跳过门神经元及 OOD 高误差回退能力，并与外部冻结专家（Mini-LLaMA / HTTP 服务）无路由器协同。
+基于 **Mora v0.111.0** 语言工具链实现的 **CAD-BEBC（连续自回归扩散块外双向因果架构）** 统一系统：以连续潜空间块扩散为主干，整合**块内双向 + 块外可微双向因果 $W_{\text{blk}}$ + 前缀因果顺序**，融合反向传播梯度与死区软门（`m_low / m_fail` + 静息偏置 `b_rest`），由权重自身缓慢演进自然涌现跨步低秩短通路、跳过门神经元及 OOD 高误差回退能力，并与外部冻结专家（Mini-LLaMA / HTTP 服务）无路由器协同。
 
 ## 统一系统架构
 
@@ -12,12 +12,12 @@ LatentCodec（连续潜空间编码：src/latent_codec.mora）
   │
   ▼
 CAD-BEBC 统一调度与演化（src/cad_bebc.mora + src/diffusion/pipeline.mora）
-  ├─ 外部冻结专家快速通道 (pi_int < 0.2) ──► 冻结 Mini-LLaMA / HTTP 服务（0 扩散步直出）
-  ├─ 内化短通路 (g_k >= 0.85)             ──► 跨步低秩映射（跳过中间主干步，NFE 8 -> 2）
+  ├─ 外部冻结专家快速通道 (pi_int < 0.05)  ──► 冻结 Mini-LLaMA / HTTP 服务（0 扩散步直出）
+  ├─ 内化短通路 (g_k >= theta_skip)     ──► 跨步低秩映射（跳过中间主干步，NFE 8 -> 2）
   └─ 连续块扩散主干                       ──► 多步流匹配去噪（块内双向 + 块外 W_blk + 前缀因果）
   │
   ▼
-LatentCodec 解码输出 / 误差门控权重演进（m_ok / m_fail + b_rest + 反传 W_blk）
+LatentCodec 解码输出 / 误差门控权重演进（m_low / m_fail + b_rest + 反传 W_blk）
 ```
 
 ## 目录结构
@@ -29,7 +29,7 @@ LatentCodec 解码输出 / 误差门控权重演进（m_ok / m_fail + b_rest + �
 ├── config/
 │   ├── default.json                # 外部 Mini-LLaMA 预训练与分词器配置
 │   ├── diffusion.json              # CAD-BEBC 默认配置（2 层 D=32、prefix_blocks=2、mode=llama）
-│   └── diffusion_scale.json        # CAD-BEBC 扩展配置档位（4 层 D=64、12 步、mode=http）
+│   └── diffusion.industrial.json   # CAD-BEBC 工业级目标配置（d=256、8 层、16 块）
 ├── data/
 │   └── corpus.txt                  # 文本语料（用于 Mini-LLaMA 预训练与 CAD-BEBC 连续潜空间评估）
 ├── docs/
@@ -43,13 +43,13 @@ LatentCodec 解码输出 / 误差门控权重演进（m_ok / m_fail + b_rest + �
 │   ├── latent_codec.mora           # 离散文本 <-> 连续潜空间块编解码器
 │   ├── diffusion/
 │   │   ├── config.mora             # CAD-BEBC 超参数与外部专家配置加载
-│   │   ├── backbone.mora           # 2 层连续块扩散主干（Pre-RMSNorm + 结构偏置注意力 + SwiGLU）
+│   │   ├── backbone.mora           # 连续块扩散主干（Pre-RMSNorm + 结构偏置注意力 + SwiGLU）
 │   │   ├── causal_graph.mora       # 块内双向 + 前缀因果掩码 + 误差门控反传块间因果权重 W_blk
-│   │   ├── shortcut.mora           # 死区软门 m_ok/m_fail、影子对齐损失与门控神经元 (w_g, b_g)
+│   │   ├── shortcut.mora           # 死区软门 m_low/m_fail、跨步低秩短通路与门控神经元 (w_g, b_g)
 │   │   ├── expert.mora             # 外部冻结专家统一适配器（支持 llama / http / safetensors）
 │   │   ├── external_service.mora   # 基于 std/net/http 的独立外部模型 HTTP 服务 (/v1/predict, /health)
 │   │   ├── prepare_external_expert.mora  # 离线生成备用 SafeTensors 专家权重工具
-│   │   └── pipeline.mora           # 融合反传梯度与死区慢可塑性 (emerge_step)、真跳步推理与文本管线
+│   │   └── pipeline.mora           # 统一可微损失与死区慢可塑性 (emerge_step)、真跳步推理与文本管线
 │   ├── config.mora                 # Mini-LLaMA 配置加载（供外部专家预训练与 LatentCodec 共用）
 │   ├── tokenizer.mora              # 纯 Mora UTF-8 字节级分词器（Vocab = 101）
 │   ├── data.mora                   # 语料切分、多批次采样、因果掩码与 RoPE 表
