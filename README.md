@@ -24,16 +24,15 @@ flowchart TD
 使用 TinyStories 样本（`data/tinystories_sample.txt`，~2MB）进行主干预训练：
 
 ```bash
-# 修改 src/train.mora 中的配置路径为 config/train_tinystories.json，或直接运行
 mora src/train.mora
 ```
 
-配置见 `config/train_tinystories.json`（d_model=128，4 层，seq_len=64，2000 步）。
+配置见 `config/train_tinystories.json`（d_model=128，4 层，seq_len=64，2000 步）。需把 `src/train.mora` 里的配置路径改为 `config/train_tinystories.json`。
 
 训练完成后可推到 Hugging Face：
 
 ```bash
-python scripts/prepare_hf.py
+mora scripts/prepare_hf.mora
 huggingface-cli upload Microbiosis/cad-bebc-tinystories hf_model .
 ```
 
@@ -58,7 +57,7 @@ huggingface-cli upload Microbiosis/cad-bebc-tinystories hf_model .
 │   └── external_expert.safetensors    # 备用离线冻结 SwiGLU 外部专家权重（14,400 参数）
 ├── checkpoints/                    # 训练输出目录（按 .gitignore 忽略权重缓存）
 ├── scripts/
-│   └── prepare_hf.py               # 生成 HF 模型卡并提供上传命令
+│   └── prepare_hf.mora             # 生成 HF 模型卡
 ├── src/
 │   ├── cad_bebc.mora               # 【统一主入口】CAD-BEBC 全流程演化、文本/潜空间统一推理与 OOD 适应
 │   ├── latent_codec.mora           # 离散文本 <-> 连续潜空间块编解码器
