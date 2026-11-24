@@ -1,0 +1,5 @@
+# Mora source files are checked out with LF endings on every platform.
+# `mora fmt --check src tests` compares the working tree against the
+# formatter's LF output, so a CRLF checkout (the default of
+# core.autocrlf=true on Windows) would report every file as unformatted.
+*.mora text eol=lf

@@ -70,43 +70,43 @@ export task save_cad_bebc(path: string, sys: InternalizedDiffusionSystem, step: 
     end
   end
 
-task cad_req_tensor(ts: dict<string, any>, name: string): Tensor<f64, _, cpu>
-  let t = ts.get(name)
-  assert(type_of(t) == "tensor", "missing CAD-BEBC tensor: " + name)
-  return t.contiguous()
-end
+  task cad_req_tensor(ts: dict<string, any>, name: string): Tensor<f64, _, cpu>
+    let t = ts.get(name)
+    assert(type_of(t) == "tensor", "missing CAD-BEBC tensor: " + name)
+    return t.contiguous()
+  end
 
-export task load_cad_bebc(path: string, cfg: DiffusionAppConfig, device: string = "cpu"): InternalizedDiffusionSystem
-  let res = safetensors_load(path, device)
-  let sf: SafetensorsFile = match res with
-      SafetensorsResult::Ok(f) -> f
-      SafetensorsResult::Err(_) -> SafetensorsFile(metadata = {}, headers = {}, tensors = {})
+  export task load_cad_bebc(path: string, cfg: DiffusionAppConfig, device: string = "cpu"): InternalizedDiffusionSystem
+    let res = safetensors_load(path, device)
+    let sf: SafetensorsFile = match res with
+        SafetensorsResult::Ok(f) -> f
+        SafetensorsResult::Err(_) -> SafetensorsFile(metadata = {}, headers = {}, tensors = {})
+      end
+      assert(sf.tensors.len() > 0, "failed to load CAD-BEBC SafeTensors checkpoint: " + path)
+      let ts = sf.tensors
+      let mc = cfg.model
+
+      let bp = BackboneParams(in_proj = cad_req_tensor(ts, "backbone.in_proj.weight"), cond_proj = cad_req_tensor(ts, "backbone.cond_proj.weight"), pos_emb = cad_req_tensor(ts, "backbone.pos_emb.weight"), time_proj = cad_req_tensor(ts, "backbone.time_proj.weight"), attn_norm = cad_req_tensor(ts, "backbone.attn_norm.weight"), wq = cad_req_tensor(ts, "backbone.wq.weight"), wk = cad_req_tensor(ts, "backbone.wk.weight"), wv = cad_req_tensor(ts, "backbone.wv.weight"), wo = cad_req_tensor(ts, "backbone.wo.weight"), ffn_norm = cad_req_tensor(ts, "backbone.ffn_norm.weight"), w_gate = cad_req_tensor(ts, "backbone.w_gate.weight"), w_up = cad_req_tensor(ts, "backbone.w_up.weight"), w_down = cad_req_tensor(ts, "backbone.w_down.weight"), out_norm = cad_req_tensor(ts, "backbone.out_norm.weight"), out_proj = cad_req_tensor(ts, "backbone.out_proj.weight"))
+
+      let p_blk = build_block_projection(mc.num_blocks, mc.block_size)
+      let off_diag = build_off_diag_mask(mc.num_blocks)
+      let prefix_mask = build_prefix_causal_mask(mc.num_blocks, mc.block_size, mc.prefix_blocks)
+      let exp = load_external_expert(cfg.external_expert, mc.rms_eps, device)
+
+      let step_v = sf.metadata.get("step")
+      let step_num = if step_v == nil then 0 else int(str(step_v)) end
+
+      let sched = make_vp_schedule(mc.num_steps, mc.beta_start, mc.beta_end)
+      return InternalizedDiffusionSystem(cfg = cfg, sched = sched, backbone = bp, w_blk = cad_req_tensor(ts, "plasticity.w_blk"), p_blk = p_blk, off_diag = off_diag, prefix_mask = prefix_mask, u_all = cad_req_tensor(ts, "plasticity.u_all"), v_all = cad_req_tensor(ts, "plasticity.v_all"), wg_all = cad_req_tensor(ts, "plasticity.wg_all"), bg_all = cad_req_tensor(ts, "plasticity.bg_all"), w_comp = cad_req_tensor(ts, "plasticity.w_comp"), b_comp = cad_req_tensor(ts, "plasticity.b_comp"), expert = exp, total_steps = step_num)
     end
-  assert(sf.tensors.len() > 0, "failed to load CAD-BEBC SafeTensors checkpoint: " + path)
-  let ts = sf.tensors
-  let mc = cfg.model
 
-  let bp = BackboneParams(in_proj = cad_req_tensor(ts, "backbone.in_proj.weight"), cond_proj = cad_req_tensor(ts, "backbone.cond_proj.weight"), pos_emb = cad_req_tensor(ts, "backbone.pos_emb.weight"), time_proj = cad_req_tensor(ts, "backbone.time_proj.weight"), attn_norm = cad_req_tensor(ts, "backbone.attn_norm.weight"), wq = cad_req_tensor(ts, "backbone.wq.weight"), wk = cad_req_tensor(ts, "backbone.wk.weight"), wv = cad_req_tensor(ts, "backbone.wv.weight"), wo = cad_req_tensor(ts, "backbone.wo.weight"), ffn_norm = cad_req_tensor(ts, "backbone.ffn_norm.weight"), w_gate = cad_req_tensor(ts, "backbone.w_gate.weight"), w_up = cad_req_tensor(ts, "backbone.w_up.weight"), w_down = cad_req_tensor(ts, "backbone.w_down.weight"), out_norm = cad_req_tensor(ts, "backbone.out_norm.weight"), out_proj = cad_req_tensor(ts, "backbone.out_proj.weight"))
-
-  let p_blk = build_block_projection(mc.num_blocks, mc.block_size)
-  let off_diag = build_off_diag_mask(mc.num_blocks)
-  let prefix_mask = build_prefix_causal_mask(mc.num_blocks, mc.block_size, mc.prefix_blocks)
-  let exp = load_external_expert(cfg.external_expert, mc.rms_eps, device)
-
-  let step_v = sf.metadata.get("step")
-  let step_num = if step_v == nil then 0 else int(str(step_v)) end
-
-  let sched = make_vp_schedule(mc.num_steps, mc.beta_start, mc.beta_end)
-  return InternalizedDiffusionSystem(cfg = cfg, sched = sched, backbone = bp, w_blk = cad_req_tensor(ts, "plasticity.w_blk"), p_blk = p_blk, off_diag = off_diag, prefix_mask = prefix_mask, u_all = cad_req_tensor(ts, "plasticity.u_all"), v_all = cad_req_tensor(ts, "plasticity.v_all"), wg_all = cad_req_tensor(ts, "plasticity.wg_all"), bg_all = cad_req_tensor(ts, "plasticity.bg_all"), w_comp = cad_req_tensor(ts, "plasticity.w_comp"), b_comp = cad_req_tensor(ts, "plasticity.b_comp"), expert = exp, total_steps = step_num)
-end
-
-export task inspect_cad_bebc(path: string): CadBebcCheckpointHeader
-  let res = safetensors_inspect(path)
-  let hdr = match res with
-      SafetensorsResult::Ok(h) -> h
-      SafetensorsResult::Err(_) -> SafetensorsHeader(header_len = 0, data_offset = 8, metadata = {}, tensors = {})
-    end
-  let step_v = hdr.metadata.get("step")
-  let arch_v = hdr.metadata.get("architecture")
-  return CadBebcCheckpointHeader(path = path, num_tensors = hdr.tensors.len(), bytes = hdr.header_len, architecture = if arch_v == nil then "" else str(arch_v) end, step = if step_v == nil then 0 else int(str(step_v)) end)
-end
+    export task inspect_cad_bebc(path: string): CadBebcCheckpointHeader
+      let res = safetensors_inspect(path)
+      let hdr = match res with
+          SafetensorsResult::Ok(h) -> h
+          SafetensorsResult::Err(_) -> SafetensorsHeader(header_len = 0, data_offset = 8, metadata = {}, tensors = {})
+        end
+        let step_v = hdr.metadata.get("step")
+        let arch_v = hdr.metadata.get("architecture")
+        return CadBebcCheckpointHeader(path = path, num_tensors = hdr.tensors.len(), bytes = hdr.header_len, architecture = if arch_v == nil then "" else str(arch_v) end, step = if step_v == nil then 0 else int(str(step_v)) end)
+      end

@@ -58,49 +58,49 @@ export task corpus_latent_batch(c: ByteCorpus, codec: LatentCodec, index: int, n
   let eye = build_eye_rows(codec.tok.vocab_size)
   let onehot = encode_ids_onehot([padded], eye)
   let z_clean = no_grad
-    onehot @ codec.llama_params.tok_emb
-  end
+  onehot @ codec.llama_params.tok_emb
+end
 
-  random.seed(seed)
-  let noise = Tensor::randn(z_clean.shape(), "f64", "cpu") * 0.25
-  let rows = z_clean.to_list()
-  let nrows = noise.to_list()
-  let out_rows: list<list<list<float>>> = []
-  let clean_rows: list<list<list<float>>> = []
-  let b = 0
-  while b < rows.len()
-    let r = rows[b]
-    let nr = nrows[b]
-    let orow: list<list<float>> = []
-    let crow: list<list<float>> = []
-    let t = 0
-    while t < seq
-      let pos_in_blk = t % block_size
-      let or: list<float> = []
-      let cr: list<float> = []
-      let ch = 0
-      while ch < codec.d_model
-        let cv = float(r[t][ch])
-        let nv = float(nr[t][ch])
-        let v = cv
-        if corrupt_odd and pos_in_blk % 2 == 1 then
-          assign v = cv * 0.15 + nv * 1.5
-        else
-          assign v = cv + nv * 0.3
-        end
-        assign or = or.push(v)
-        assign cr = cr.push(cv)
-        assign ch = ch + 1
+random.seed(seed)
+let noise = Tensor::randn(z_clean.shape(), "f64", "cpu") * 0.25
+let rows = z_clean.to_list()
+let nrows = noise.to_list()
+let out_rows: list<list<list<float>>> = []
+let clean_rows: list<list<list<float>>> = []
+let b = 0
+while b < rows.len()
+  let r = rows[b]
+  let nr = nrows[b]
+  let orow: list<list<float>> = []
+  let crow: list<list<float>> = []
+  let t = 0
+  while t < seq
+    let pos_in_blk = t % block_size
+    let or: list<float> = []
+    let cr: list<float> = []
+    let ch = 0
+    while ch < codec.d_model
+      let cv = float(r[t][ch])
+      let nv = float(nr[t][ch])
+      let v = cv
+      if corrupt_odd and pos_in_blk % 2 == 1 then
+        assign v = cv * 0.15 + nv * 1.5
+      else
+        assign v = cv + nv * 0.3
       end
-      assign orow = orow.push(or)
-      assign crow = crow.push(cr)
-      assign t = t + 1
+      assign or = or.push(v)
+      assign cr = cr.push(cv)
+      assign ch = ch + 1
     end
-    assign out_rows = out_rows.push(orow)
-    assign clean_rows = clean_rows.push(crow)
-    assign b = b + 1
+    assign orow = orow.push(or)
+    assign crow = crow.push(cr)
+    assign t = t + 1
   end
-  return [Tensor::from_list(out_rows, "f64"), Tensor::from_list(clean_rows, "f64")]
+  assign out_rows = out_rows.push(orow)
+  assign clean_rows = clean_rows.push(crow)
+  assign b = b + 1
+end
+return [Tensor::from_list(out_rows, "f64"), Tensor::from_list(clean_rows, "f64")]
 end
 
 -- Backbone pretraining on REAL corpus windows.
@@ -183,14 +183,14 @@ export task ddim_chain_mse(sys: InternalizedDiffusionSystem, mc: DiffModelConfig
   let step = k
   while step >= 1
     let x0h = no_grad
-      backbone_predict_x0(sys.backbone, mc, z, vp_tau(sys.sched, step - 1), x_obs, bias)
-    end
-    assign z = no_grad
-      ddim_step(sys.sched, step - 1, step - 2, z, x0h, mc.ddim_eta)
-    end
-    assign step = step - 1
+    backbone_predict_x0(sys.backbone, mc, z, vp_tau(sys.sched, step - 1), x_obs, bias)
   end
-  return float(((z - x_0) * (z - x_0)).mean())
+  assign z = no_grad
+  ddim_step(sys.sched, step - 1, step - 2, z, x0h, mc.ddim_eta)
+end
+assign step = step - 1
+end
+return float(((z - x_0) * (z - x_0)).mean())
 end
 
 task main()
