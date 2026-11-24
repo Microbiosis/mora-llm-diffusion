@@ -35,6 +35,9 @@ mora src/train_cad_bebc.mora
   `W_blk`、短通路 `U/V`、跳步门与竞争门）
 - 指标：`checkpoints/cad_bebc_metrics.json`
 - 机制修复与实测记录：`docs/mechanism_fixes_2026-11-24.md`
+- 离散化：标准 VP 前向过程 + DDIM 采样器（`src/diffusion/schedule.mora`），
+  观测以**独立投影加性注入**为条件（拼接无 autograd 支持，会使骨干梯度归零）
+- 训练分两阶段：① 骨干在**真实语料**上按 VP 过程预训练；② 误差门控巩固
 
 已发布产物：<https://huggingface.co/redmingwei/cad-bebc-tinystories>
 
@@ -76,6 +79,7 @@ mora src/train.mora
 │   │   ├── config.mora             # CAD-BEBC 超参数与外部专家配置加载
 │   │   ├── backbone.mora           # 连续块扩散主干（Pre-RMSNorm + 结构偏置注意力 + SwiGLU）
 │   │   ├── causal_graph.mora       # 块内双向 + 前缀因果掩码 + 误差门控反传块间因果权重 W_blk
+│   │   ├── schedule.mora           # VP 噪声调度 (alpha_bar) 与 DDIM 采样器 (x0 参数化)
 │   │   ├── shortcut.mora           # 死区软门 m_low/m_fail、跨步低秩短通路与门控神经元 (w_g, b_g)
 │   │   ├── expert.mora             # 外部冻结专家统一适配器（支持 llama / http / safetensors）
 │   │   ├── external_service.mora   # 基于 std/net/http 的独立外部模型 HTTP 服务 (/v1/predict, /health)

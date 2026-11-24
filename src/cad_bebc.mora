@@ -6,16 +6,19 @@ import "std/nn/safetensors"
 import "src/config.mora"
 import "src/tokenizer.mora"
 import "src/data.mora"
+import "src/data/corpus.mora"
 import "src/model.mora"
 import "src/checkpoint.mora"
 import "src/sampler.mora"
 import "src/latent_codec.mora"
 import "src/diffusion/config.mora"
+import "src/diffusion/schedule.mora"
 import "src/diffusion/causal_graph.mora"
 import "src/diffusion/backbone.mora"
 import "src/diffusion/shortcut.mora"
 import "src/diffusion/expert.mora"
 import "src/diffusion/pipeline.mora"
+import "src/train_cad_bebc.mora"
 
 task main()
   let cfg = load_diffusion_config("config/diffusion.json")
@@ -26,15 +29,30 @@ task main()
   print("arch:", cfg.architecture, "| layers:", mc.n_layers, "| blocks:", mc.num_blocks, "x", mc.block_size, "(prefix:", mc.prefix_blocks, ") | D:", mc.d_model, "| external_mode:", cfg.external_expert.mode)
 
   let codec = load_latent_codec("config/default.json", cfg.external_expert.llama_checkpoint_path)
-  let sys = init_diffusion_system(cfg)
-  print("backbone_params:", count_backbone_parameters(sys.backbone), "| frozen_external_expert:", count_expert_parameters(sys.expert), "| vocab:", codec.tok.vocab_size)
+  let corpus = load_byte_corpus("data/tinystories_sample.txt")
+  print("corpus bytes:", corpus.n_bytes, "| latent dim:", codec.d_model, "| vocab:", codec.tok.vocab_size)
+
+  -- The unified entrypoint works on REAL corpus windows, like the training
+  -- entrypoint: the previous version drove the whole lifecycle from synthetic
+  -- sinusoids, which is not the distribution the system is meant to run on.
+  let sched = make_vp_schedule(mc.num_steps, mc.beta_start, mc.beta_end)
+  let p_blk0 = build_block_projection(mc.num_blocks, mc.block_size)
+  let off_diag0 = build_off_diag_mask(mc.num_blocks)
+  let prefix_mask0 = build_prefix_causal_mask(mc.num_blocks, mc.block_size, mc.prefix_blocks)
+  let w_blk0 = init_w_blk(off_diag0, mc.init_iso)
+  let init_bias0 = struct_bias_from_wblk(w_blk0, p_blk0, off_diag0, prefix_mask0)
+  let bp0 = init_backbone_params(mc, sc.seed)
+  let bp = pretrain_backbone_real(bp0, mc, sched, init_bias0, corpus, codec, sc.pretrain_steps, sc.pretrain_lr, sc.seed)
+  let sys_cfg = DiffusionAppConfig(architecture = cfg.architecture, external_expert = cfg.external_expert, model = mc, plasticity = cfg.plasticity, schedule = ScheduleConfig(pretrain_steps = 0, pretrain_lr = sc.pretrain_lr, cold_start_steps = sc.cold_start_steps, consolidation_steps = sc.consolidation_steps, mature_eval_steps = sc.mature_eval_steps, ood_adapt_steps = sc.ood_adapt_steps, seed = sc.seed))
+  let sys = init_diffusion_system(sys_cfg, bp)
+  print("backbone_params:", count_backbone_parameters(sys.backbone), "| frozen_external_expert:", count_expert_parameters(sys.expert))
 
   let seq_expected = mc.num_blocks * mc.block_size
   let text_ok = codec.d_model == mc.d_model and codec.seq_len == seq_expected
 
   -- Phase 1: Cold Start Unified Inference
-  let s_pair0 = sample_structured_batch(2, mc.num_blocks, mc.block_size, mc.d_model, "simple", sc.seed + 100)
-  let c_pair0 = sample_structured_batch(2, mc.num_blocks, mc.block_size, mc.d_model, "complex", sc.seed + 200)
+  let s_pair0 = corpus_latent_batch(corpus, codec, 100, mc.num_blocks, mc.block_size, false, sc.seed + 100)
+  let c_pair0 = corpus_latent_batch(corpus, codec, 200, mc.num_blocks, mc.block_size, true, sc.seed + 200)
   let inf_s0 = infer_system(sys, s_pair0[0], false)
   let inf_c0 = infer_system(sys, c_pair0[0], false)
   print("--- Phase 1: Cold Start (Frozen Mini-LLaMA Fast Path) ---")
@@ -46,7 +64,7 @@ task main()
   let st = 1
   while st <= sc.consolidation_steps
     let reg = if st % 4 == 0 then "simple" else "complex" end
-    let pair = sample_structured_batch(2, mc.num_blocks, mc.block_size, mc.d_model, reg, sc.seed + 1000 + st)
+    let pair = corpus_latent_batch(corpus, codec, 1000 + st, mc.num_blocks, mc.block_size, true, sc.seed + 1000 + st)
     let em = emerge_step(sys, pair[0], pair[1], sc.seed + 5000 + st)
     assign sys = em.system
     if st == 1 or st == 60 or st == 130 or st == 200 or st == sc.consolidation_steps then
@@ -63,7 +81,7 @@ task main()
   let mse_full_sum = 0.0
   let m_step = 1
   while m_step <= sc.mature_eval_steps
-    let pair = sample_structured_batch(2, mc.num_blocks, mc.block_size, mc.d_model, "complex", sc.seed + 15000 + m_step)
+    let pair = corpus_latent_batch(corpus, codec, 15000 + m_step, mc.num_blocks, mc.block_size, true, sc.seed + 15000 + m_step)
     let inf_short = infer_system(sys, pair[0], false)
     let inf_full = infer_system(sys, pair[0], true)
     assign nfe_sum = nfe_sum + inf_short.backbone_nfe
@@ -89,7 +107,7 @@ task main()
   print("--- Phase 4: OOD High-Error Fallback (", sc.ood_adapt_steps, "steps ) ---")
   let ood_st = 1
   while ood_st <= sc.ood_adapt_steps
-    let ood_pair = sample_structured_batch(2, mc.num_blocks, mc.block_size, mc.d_model, "ood", sc.seed + 25000 + ood_st)
+    let ood_pair = corpus_latent_batch(corpus, codec, 25000 + ood_st, mc.num_blocks, mc.block_size, true, sc.seed + 25000 + ood_st + 77777)
     let em_ood = emerge_step(sys, ood_pair[0], ood_pair[1], sc.seed + 30000 + ood_st)
     assign sys = em_ood.system
     if ood_st == 15 or ood_st == 30 or ood_st == sc.ood_adapt_steps then
