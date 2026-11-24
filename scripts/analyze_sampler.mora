@@ -1,0 +1,131 @@
+-- Sampler analysis: how the DDIM start step interacts with the backbone
+-- evaluation budget and with the internalized shortcut.
+--
+-- Why this file exists
+-- -------------------
+-- docs/mechanism_fixes_2026-11-24.md §7.5 recorded the honest negative result
+-- that the DDIM chain gets WORSE as it gets longer on this data, and §7.6
+-- listed the first open question:
+--
+--     "起点噪声与步数预算匹配：当前 infer_start_step 固定为 8。多步劣于单步的
+--      根因之一是观测投影到高噪声层时丢失信息，应让起点随可用步数自适应。"
+--
+-- i.e. the observation is projected onto a HIGH noise level even when the
+-- sampler spends far fewer backbone calls than that, which throws away
+-- observation information the shortened chain never recovers.
+--
+-- This script measures the effect directly on the trained system. For every
+-- start step it evaluates, on the SAME held-out real-corpus windows:
+--
+--   * FULL path    : no shortcut, every segment runs the backbone.
+--   * SHORT path   : the matured shortcut replaces the segments it is trained
+--                    on, so the chain spends fewer backbone calls.
+--   * SINGLE-SHOT  : one backbone call at that start level, no chain at all
+--                    (the matched-compute reference for the short path).
+--
+-- and reports the MSE together with the number of backbone evaluations (NFE)
+-- that each path actually spends.
+--
+-- The window indices and seeds are the ones used by the held-out evaluation in
+-- src/train_cad_bebc.mora, so the numbers are directly comparable with the
+-- training log.
+--
+-- Usage:
+--     mora src/train_cad_bebc.mora      # produces the checkpoint
+--     mora scripts/analyze_sampler.mora
+
+import "src/config.mora"
+import "src/tokenizer.mora"
+import "src/data.mora"
+import "src/data/corpus.mora"
+import "src/model.mora"
+import "src/latent_codec.mora"
+import "src/diffusion/config.mora"
+import "src/diffusion/schedule.mora"
+import "src/diffusion/causal_graph.mora"
+import "src/diffusion/backbone.mora"
+import "src/diffusion/shortcut.mora"
+import "src/diffusion/expert.mora"
+import "src/diffusion/pipeline.mora"
+import "src/diffusion/checkpoint.mora"
+import "src/train_cad_bebc.mora"
+
+-- A copy of the system whose sampler starts at a different VP schedule step.
+-- Everything else (weights, plasticity state, schedule) is shared, so the
+-- comparison isolates the start step.
+task with_start(sys: InternalizedDiffusionSystem, start: int): InternalizedDiffusionSystem
+  let mc = sys.cfg.model
+  let mc2 = DiffModelConfig(architecture = mc.architecture, n_layers = mc.n_layers, num_blocks = mc.num_blocks, block_size = mc.block_size, prefix_blocks = mc.prefix_blocks, d_model = mc.d_model, n_heads = mc.n_heads, head_dim = mc.head_dim, ffn_hidden = mc.ffn_hidden, rms_eps = mc.rms_eps, num_steps = mc.num_steps, shortcut_rank = mc.shortcut_rank, init_iso = mc.init_iso, b_rest = mc.b_rest, b_max = mc.b_max, init_comp_bias = mc.init_comp_bias, theta_skip = mc.theta_skip, shortcut_u_init = mc.shortcut_u_init, shortcut_v_init = mc.shortcut_v_init, beta_start = mc.beta_start, beta_end = mc.beta_end, cond_inject = mc.cond_inject, ddim_eta = mc.ddim_eta, infer_start_step = start)
+  let cfg2 = DiffusionAppConfig(architecture = sys.cfg.architecture, external_expert = sys.cfg.external_expert, model = mc2, plasticity = sys.cfg.plasticity, schedule = sys.cfg.schedule)
+  return InternalizedDiffusionSystem(cfg = cfg2, sched = sys.sched, backbone = sys.backbone, w_blk = sys.w_blk, p_blk = sys.p_blk, off_diag = sys.off_diag, prefix_mask = sys.prefix_mask, u_all = sys.u_all, v_all = sys.v_all, wg_all = sys.wg_all, bg_all = sys.bg_all, w_comp = sys.w_comp, b_comp = sys.b_comp, expert = sys.expert, total_steps = sys.total_steps)
+end
+
+-- One backbone call at schedule level `level`: the state is the observation
+-- projected onto the VP trajectory at that level and the backbone is asked for
+-- x0 directly (no chain). This is the matched-compute reference for a path
+-- that spends a single backbone evaluation.
+task single_shot_mse(sys: InternalizedDiffusionSystem, mc: DiffModelConfig, bias: Tensor<f64, _, cpu>, x_obs: Tensor<f64, _, cpu>, x_0: Tensor<f64, _, cpu>, level: int, seed: int): float
+  random.seed(seed)
+  let eps_s = Tensor::randn(x_0.shape(), "f64", "cpu")
+  let ab = vp_alpha_bar(sys.sched, level - 1)
+  let z = x_obs * math.sqrt(ab) + eps_s * math.sqrt(1.0 - ab)
+  let x0h = no_grad
+  backbone_predict_x0(sys.backbone, mc, z, vp_tau(sys.sched, level - 1), x_obs, bias)
+end
+let d = x0h - x_0
+float((d * d).mean())
+end
+
+task main()
+  let cfg = load_diffusion_config("config/diffusion.json")
+  let mc = cfg.model
+  let codec = load_latent_codec("config/default.json", cfg.external_expert.llama_checkpoint_path)
+  let corpus = load_byte_corpus("data/tinystories_sample.txt")
+  let ckpt = "checkpoints/cad_bebc_trained.safetensors"
+  let sys = load_cad_bebc(ckpt, cfg, "cpu")
+  let bias = struct_bias_from_wblk(sys.w_blk, sys.p_blk, sys.off_diag, sys.prefix_mask)
+
+  print("=== DDIM start-step sweep on held-out real corpus ===")
+  print("checkpoint:", ckpt, "| windows:", 12, "| num_steps:", mc.num_steps, "| configured start:", mc.infer_start_step)
+
+  let n = 12
+  let start = 1
+  while start <= mc.num_steps
+    let s2 = with_start(sys, start)
+    let m_full = 0.0
+    let m_short = 0.0
+    let m_one = 0.0
+    let nfe_full = 0
+    let nfe_short = 0
+    let skips = 0
+    let i = 0
+    while i < n
+      let pair = corpus_latent_batch(corpus, codec, 900000 + i * 13, mc.num_blocks, mc.block_size, true, cfg.schedule.seed + 4242 + i)
+      let f = infer_system(s2, pair[0], true)
+      let sh = infer_system(s2, pair[0], false, true)
+      let df = f.output - pair[1]
+      let ds = sh.output - pair[1]
+      assign m_full = m_full + float((df * df).mean())
+      assign m_short = m_short + float((ds * ds).mean())
+      assign m_one = m_one + single_shot_mse(sys, mc, bias, pair[0], pair[1], start, cfg.schedule.seed + 4242 + i)
+      assign nfe_full = nfe_full + f.backbone_nfe
+      assign nfe_short = nfe_short + sh.backbone_nfe
+      assign skips = skips + sh.shortcuts_used
+      assign i = i + 1
+    end
+    let dn = float(n)
+    print("start:", start, "| full MSE:", m_full / dn, "| nfe:", float(nfe_full) / dn, "| short MSE:", m_short / dn, "| nfe:", float(nfe_short) / dn, "| skips:", float(skips) / dn, "| single-shot MSE:", m_one / dn)
+    assign start = start + 1
+  end
+
+  -- The observation baseline: what "no repair at all" costs on the same windows.
+  let m_obs = 0.0
+  let i = 0
+  while i < n
+    let pair = corpus_latent_batch(corpus, codec, 900000 + i * 13, mc.num_blocks, mc.block_size, true, cfg.schedule.seed + 4242 + i)
+    let dob = pair[0] - pair[1]
+    assign m_obs = m_obs + float((dob * dob).mean())
+    assign i = i + 1
+  end
+  print("observation baseline MSE:", m_obs / float(n))
+end

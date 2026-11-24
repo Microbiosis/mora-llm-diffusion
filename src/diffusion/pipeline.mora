@@ -154,108 +154,108 @@ export task unified_diff_loss(p_wblk: Tensor<f64, _, cpu>, p_u: Tensor<f64, _, c
   -- So the internal branch is additionally evaluated from x_obs, matching the
   -- inference semantics in infer_system.
   let y_int_obs = no_grad
-    backbone_ode_step(bp, mc, x_obs, mc.num_steps, cond, sched, bias)
-  end
-  let e_int = no_grad
-    ((y_int_obs - x_0) * (y_int_obs - x_0)).mean()
-  end
-  let e_ext = no_grad
-    ((y_ext - x_0) * (y_ext - x_0)).mean()
-  end
-  let advantage = e_ext - e_int
-  -- Keep the term DIFFERENTIABLE in pi_int.
-  -- (d_mix * d_mix).mean() yields a scalar, so the penalty is kept as a tensor and
-  -- folded into the final loss as a tensor; float(...) at the very end converts the
-  -- accumulated 1-element tensor to the scalar return value while keeping the
-  -- autograd edge into pi_int -> p_wcomp / p_bcomp.
-  -- Competition gate: error-driven advantage, not an unconditional prior.
-  --
-  -- The mixed-reconstruction term alone CANNOT drive the competition: with
-  --   y_mix = y_int*pi + y_ext*(1-pi)
-  -- its gradient wrt pi is 2*d_mix*(y_int - y_ext), which points AWAY from the
-  -- internal branch whenever mixing already reduces the error (measured
-  -- g_bcomp = -0.0057 even though the internal path was clearly better:
-  -- MSE 0.2895 vs 0.3615). So the gate needs an explicit, sign-correct driver.
-  --
-  -- We therefore add a differentiable ADVANTAGE term on the gate logit:
-  --   d(pi)/d(logit) = pi*(1-pi)
-  -- and the desired logit shift is proportional to (e_ext - e_int), i.e. the gate
-  -- moves towards the internal branch exactly when the internal branch is more
-  -- accurate, and towards the external branch when it is not.
-  -- Competition gate: supervised directly towards the more accurate branch.
-  --
-  -- Why not rely on the mixed-reconstruction gradient: with
-  --   y_mix = y_int*pi + y_ext*(1-pi)
-  -- its gradient wrt pi is 2*d_mix*(y_int - y_ext), which points AWAY from the
-  -- internal branch whenever mixing already lowers the error (measured
-  -- g_bcomp = -0.0057 even though the internal path was clearly better:
-  -- MSE 0.2895 vs 0.3615). The gate therefore needs its own objective.
-  --
-  -- We supervise the gate LOGIT towards the target probability of the better
-  -- branch, with the target derived from the measured error advantage:
-  --   target_pi = sigmoid(adv_logit_scale * advantage)   (internal if advantage>0)
-  -- and minimise (logit - logit(target_pi))^2. The logit-space form keeps the
-  -- gradient usable even when the gate is deeply saturated (pi_int ~ 0.018).
-  let pi_logit = ((x_obs.rms_norm(mc.rms_eps) * p_wcomp).mean() + p_bcomp)
-  -- The target is derived from the SIGN of the advantage, not its magnitude.
-  -- Using the raw magnitude made the target logit flip sign between windows (the
-  -- advantage is small and noisy on real corpus data), so the gate oscillated
-  -- around its initial value instead of moving. The sign is the robust signal:
-  -- "internal branch is more accurate" vs "external branch is more accurate".
-  let adv_sign = if advantage > 0.0 then 1.0 else -1.0 end
-  let adv_scaled = pc.comp_adv_scale * adv_sign
-  -- sigmoid on the scalar advantage (computed directly to avoid a tensor round-trip)
-  let target_pi = 1.0 / (1.0 + math.exp(-adv_scaled))
-  let target_logit = math.log(target_pi / (1.0 - target_pi) + 0.000000001)
-  let comp_sup = (pi_logit - target_logit) * (pi_logit - target_logit) * pc.comp_gate_weight
-  let recon = recon + comp_sup
+  backbone_ode_step(bp, mc, x_obs, mc.num_steps, cond, sched, bias)
+end
+let e_int = no_grad
+((y_int_obs - x_0) * (y_int_obs - x_0)).mean()
+end
+let e_ext = no_grad
+((y_ext - x_0) * (y_ext - x_0)).mean()
+end
+let advantage = e_ext - e_int
+-- Keep the term DIFFERENTIABLE in pi_int.
+-- (d_mix * d_mix).mean() yields a scalar, so the penalty is kept as a tensor and
+-- folded into the final loss as a tensor; float(...) at the very end converts the
+-- accumulated 1-element tensor to the scalar return value while keeping the
+-- autograd edge into pi_int -> p_wcomp / p_bcomp.
+-- Competition gate: error-driven advantage, not an unconditional prior.
+--
+-- The mixed-reconstruction term alone CANNOT drive the competition: with
+--   y_mix = y_int*pi + y_ext*(1-pi)
+-- its gradient wrt pi is 2*d_mix*(y_int - y_ext), which points AWAY from the
+-- internal branch whenever mixing already reduces the error (measured
+-- g_bcomp = -0.0057 even though the internal path was clearly better:
+-- MSE 0.2895 vs 0.3615). So the gate needs an explicit, sign-correct driver.
+--
+-- We therefore add a differentiable ADVANTAGE term on the gate logit:
+--   d(pi)/d(logit) = pi*(1-pi)
+-- and the desired logit shift is proportional to (e_ext - e_int), i.e. the gate
+-- moves towards the internal branch exactly when the internal branch is more
+-- accurate, and towards the external branch when it is not.
+-- Competition gate: supervised directly towards the more accurate branch.
+--
+-- Why not rely on the mixed-reconstruction gradient: with
+--   y_mix = y_int*pi + y_ext*(1-pi)
+-- its gradient wrt pi is 2*d_mix*(y_int - y_ext), which points AWAY from the
+-- internal branch whenever mixing already lowers the error (measured
+-- g_bcomp = -0.0057 even though the internal path was clearly better:
+-- MSE 0.2895 vs 0.3615). The gate therefore needs its own objective.
+--
+-- We supervise the gate LOGIT towards the target probability of the better
+-- branch, with the target derived from the measured error advantage:
+--   target_pi = sigmoid(adv_logit_scale * advantage)   (internal if advantage>0)
+-- and minimise (logit - logit(target_pi))^2. The logit-space form keeps the
+-- gradient usable even when the gate is deeply saturated (pi_int ~ 0.018).
+let pi_logit = ((x_obs.rms_norm(mc.rms_eps) * p_wcomp).mean() + p_bcomp)
+-- The target is derived from the SIGN of the advantage, not its magnitude.
+-- Using the raw magnitude made the target logit flip sign between windows (the
+-- advantage is small and noisy on real corpus data), so the gate oscillated
+-- around its initial value instead of moving. The sign is the robust signal:
+-- "internal branch is more accurate" vs "external branch is more accurate".
+let adv_sign = if advantage > 0.0 then 1.0 else -1.0 end
+let adv_scaled = pc.comp_adv_scale * adv_sign
+-- sigmoid on the scalar advantage (computed directly to avoid a tensor round-trip)
+let target_pi = 1.0 / (1.0 + math.exp(-adv_scaled))
+let target_logit = math.log(target_pi / (1.0 - target_pi) + 0.000000001)
+let comp_sup = (pi_logit - target_logit) * (pi_logit - target_logit) * pc.comp_gate_weight
+let recon = recon + comp_sup
 
-  let align = 0.0
-  let gate_sup = 0.0
-  let k = 0
-  while k < 3
-    let pred = shortcut_apply(seg_entries[k], p_u[k], p_v[k], mc.rms_eps)
-    let d = pred - seg_targets[k]
-    let e_align = (d * d).mean()
-    assign align = align + e_align
+let align = 0.0
+let gate_sup = 0.0
+let k = 0
+while k < 3
+  let pred = shortcut_apply(seg_entries[k], p_u[k], p_v[k], mc.rms_eps)
+  let d = pred - seg_targets[k]
+  let e_align = (d * d).mean()
+  assign align = align + e_align
 
-    -- Differentiable gate supervision.
-    -- Supervise the gate PRE-ACTIVATION logit instead of the sigmoid output:
-    -- with b_rest = -5.5 the sigmoid is saturated (g ~ 0.004), so d(g)/d(logit)
-    -- ~ 0.004 and the gate gradient was ~250x weaker than the logit gradient.
-    -- Supervising the logit keeps the gradient usable across the whole maturity ramp.
-    let z_bar = pool_mean_feature(seg_entries[k], mc.rms_eps)
-    let logit = (z_bar * p_wg[k]).mean() + p_bg[k]
-    let g = logit.sigmoid()
-    let margin = pc.eps_shortcut * 1.8
-    let raw_t = (margin - e_align) / (pc.temp_s * 2.0)
-    let target = raw_t.sigmoid()
-    -- Extra positive bias when alignment is already decent
-    let bonus = if e_align < pc.eps_shortcut then 0.35 else 0.0 end
-    let soft_target = target * (1.0 - bonus) + bonus
-    let ge = if pc.gate_logit_space > 0.5 then
-      -- Supervise the PRE-ACTIVATION logit.
-      -- The gate only needs to clear the execution threshold (theta_skip), it does not
-      -- need to saturate to probability 1.0. Driving the target logit to the
-      -- threshold margin (logit(theta_skip) + gate_margin) instead of
-      -- logit(0.999) ~ +7 keeps the maturity ramp reachable from b_rest = -5.5.
-      let th_logit = math.log(mc.theta_skip / (1.0 - mc.theta_skip) + 0.000000001)
-      let tl = th_logit + pc.gate_margin
-      let ge_l = logit - tl
-      ge_l
-    else
-      let ge_p = g - soft_target
-      ge_p
-    end
-    assign gate_sup = gate_sup + (ge * ge).mean() * pc.gate_sup_weight
-    assign k = k + 1
+  -- Differentiable gate supervision.
+  -- Supervise the gate PRE-ACTIVATION logit instead of the sigmoid output:
+  -- with b_rest = -5.5 the sigmoid is saturated (g ~ 0.004), so d(g)/d(logit)
+  -- ~ 0.004 and the gate gradient was ~250x weaker than the logit gradient.
+  -- Supervising the logit keeps the gradient usable across the whole maturity ramp.
+  let z_bar = pool_mean_feature(seg_entries[k], mc.rms_eps)
+  let logit = (z_bar * p_wg[k]).mean() + p_bg[k]
+  let g = logit.sigmoid()
+  let margin = pc.eps_shortcut * 1.8
+  let raw_t = (margin - e_align) / (pc.temp_s * 2.0)
+  let target = raw_t.sigmoid()
+  -- Extra positive bias when alignment is already decent
+  let bonus = if e_align < pc.eps_shortcut then 0.35 else 0.0 end
+  let soft_target = target * (1.0 - bonus) + bonus
+  let ge = if pc.gate_logit_space > 0.5 then
+    -- Supervise the PRE-ACTIVATION logit.
+    -- The gate only needs to clear the execution threshold (theta_skip), it does not
+    -- need to saturate to probability 1.0. Driving the target logit to the
+    -- threshold margin (logit(theta_skip) + gate_margin) instead of
+    -- logit(0.999) ~ +7 keeps the maturity ramp reachable from b_rest = -5.5.
+    let th_logit = math.log(mc.theta_skip / (1.0 - mc.theta_skip) + 0.000000001)
+    let tl = th_logit + pc.gate_margin
+    let ge_l = logit - tl
+    ge_l
+  else
+    let ge_p = g - soft_target
+    ge_p
   end
-  -- NOTE: the loss is returned as a 1-element TENSOR on purpose.
-  -- Mora's autograd seeds the root gradient only for tensor outputs
-  -- (src/runtime/autograd.rs: `grads[out_idx] = Some(vec![1.0])`); a float return
-  -- yields zero gradients for every leaf. Keeping the tensor form preserves the
-  -- autograd edge into pi_int -> p_wcomp / p_bcomp.
-  return recon + pc.align_weight * align + gate_sup
+  assign gate_sup = gate_sup + (ge * ge).mean() * pc.gate_sup_weight
+  assign k = k + 1
+end
+-- NOTE: the loss is returned as a 1-element TENSOR on purpose.
+-- Mora's autograd seeds the root gradient only for tensor outputs
+-- (src/runtime/autograd.rs: `grads[out_idx] = Some(vec![1.0])`); a float return
+-- yields zero gradients for every leaf. Keeping the tensor form preserves the
+-- autograd edge into pi_int -> p_wcomp / p_bcomp.
+return recon + pc.align_weight * align + gate_sup
 end
 
 task clamp_wblk(w: Tensor<f64, _, cpu>, off_diag: Tensor<f64, _, cpu>, init_iso: float): Tensor<f64, _, cpu>
@@ -298,32 +298,65 @@ export task emerge_step(sys: InternalizedDiffusionSystem, x_obs: Tensor<f64, _, 
 
   let y_ext = expert_predict(sys.expert, x_obs)
 
-  -- DDIM trajectory start: the forward-noised x_0 at the noisiest schedule step,
-  -- matching what the DDIM sampler visits during inference. The observation
-  -- enters only as the CONDITION, never as part of the state.
+  -- DDIM trajectory start: the OBSERVATION projected onto the VP trajectory at
+  -- the sampler's start level, i.e. exactly the state infer_system starts from.
+  --
+  -- The trajectory used to start from the forward-noised CLEAN target
+  -- (ddim_init(sched, x_0, eps)), i.e. from states around x_0, while the
+  -- sampler starts from the corrupted observation. The shadow targets of the
+  -- three shortcut slots were therefore fitted on a distribution the sampler
+  -- never visits: on clean-ish states the best a shortcut can do is learn a
+  -- near-identity map (measured V_rms 0.017, i.e. the shortcut barely moved
+  -- anything), and that map was then applied to corrupted states at inference.
+  --
+  -- Starting from the observation makes the shadow targets the states the
+  -- backbone actually produces from a corrupted input, so the shortcut has to
+  -- learn the repair itself instead of a copy of the identity.
+  let t_start = mc.infer_start_step
+  if t_start < 1 then
+    assign t_start = 1
+  end
+  if t_start > mc.num_steps then
+    assign t_start = mc.num_steps
+  end
   random.seed(seed + 11)
   let eps_init = Tensor::randn(x_0.shape(), "f64", "cpu")
+  let ab_start = vp_alpha_bar(sys.sched, t_start - 1)
   let z = no_grad
-  ddim_init(sys.sched, x_0, eps_init)
+  x_obs * math.sqrt(ab_start) + eps_init * math.sqrt(1.0 - ab_start)
 end
 
 let seg_entries: list<Tensor<f64, _, cpu>> = []
 let seg_targets: list<Tensor<f64, _, cpu>> = []
 let seg = 0
-let t_cur = mc.num_steps
-while seg < 3
+let t_cur = t_start
+while seg < 3 and t_cur >= 2
   let z_entry = z
   let z1 = no_grad
   backbone_ode_step(sys.backbone, mc, z, t_cur, cond, sys.sched, bias)
 end
-let z2 = no_grad
-backbone_ode_step(sys.backbone, mc, z1, t_cur - 1, cond, sys.sched, bias)
+let z2 = z1
+if t_cur >= 3 then
+  let z2b = no_grad
+  backbone_ode_step(sys.backbone, mc, z1, t_cur - 1, cond, sys.sched, bias)
+end
+assign z2 = z2b
 end
 assign seg_entries = seg_entries.push(z_entry)
 assign seg_targets = seg_targets.push(z2)
 assign z = z2
-assign t_cur = t_cur - 2
-assign seg = seg + 1
+assign t_cur = t_cur - (if t_cur >= 3 then 2 else 1)
+  assign seg = seg + 1
+end
+-- Land on schedule level 1 before the read-out: the sampler walks down to
+-- level 1 and reads out there, so the state the shortcut slots are trained
+-- against has to be the state the read-out will actually see.
+if t_cur >= 2 then
+  let z_tail = no_grad
+  backbone_ode_step(sys.backbone, mc, z, t_cur, cond, sys.sched, bias)
+end
+assign z = z_tail
+assign t_cur = t_cur - 1
 end
 let z_pre_final = z
 let y_int = no_grad
@@ -397,9 +430,9 @@ export task comp_gate_scalar(sys: InternalizedDiffusionSystem, x_obs: Tensor<f64
   -- NOTE: in a differentiable context Tensor.item() yields a TENSOR (which float()
   -- rejects), so the bias is read via to_list() -> [scalar].
   let logit = no_grad
-    float((x_obs.rms_norm(sys.cfg.model.rms_eps) * sys.w_comp).mean()) + sys.b_comp.to_list()[0]
-  end
-  return sigmoid_scalar(logit)
+  float((x_obs.rms_norm(sys.cfg.model.rms_eps) * sys.w_comp).mean()) + sys.b_comp.to_list()[0]
+end
+return sigmoid_scalar(logit)
 end
 
 -- force_full     : run the backbone on every step (no early skip)
@@ -454,13 +487,26 @@ end
 -- steps: when the matured gate fires, the DDIM update for that segment is
 -- REPLACED by the learned shortcut, which is what realises the "skip 2 backbone
 -- steps" claim. The skipped steps are still counted as NFE savings.
+--
+-- LEVEL CONSISTENCY (fixed): the loop now stops at schedule level 1 instead of
+-- level 0, because the read-out below is a pure x0 prediction that tells the
+-- backbone "the state sits at level 1" (tau = vp_tau(0) = 1/num_steps). With
+-- the old bound the loop had already consumed level 1, so the read-out was
+-- applied to a level-0 state: one wasted backbone evaluation per inference and
+-- a tau/state mismatch at the most important call of the sampler.
+--
+-- SPAN CONSISTENCY (fixed): only the 2-level spans are shortcut-eligible,
+-- because those are the spans the three shortcut slots are trained on
+-- (8->6, 6->4, 4->2 in emerge_step). The final 1-level span down to the
+-- read-out level is always a real backbone step, so a skipped segment always
+-- covers exactly a trained span.
 let used_sc = 0
 let g_prod = 1.0
 let seg = 0
 let nfe = 0
 let t_cur = t_start
 
-while t_cur >= 1
+while t_cur >= 2
   let seg_idx = seg % 3
   -- NOTE: Tensor.item()/float() do not accept tensors; read the scalar bias via
   -- to_list() (the gate bias tensor is 1-D, so to_list()[i] is the float).
@@ -469,40 +515,40 @@ while t_cur >= 1
   assign g_prod = g_prod * gk
   -- how many schedule steps this segment covers
   let seg_steps = if t_cur >= 3 then 2 else 1 end
-  let skip = !force_full and gk >= mc.theta_skip
+  let skip = !force_full and seg_steps == 2 and gk >= mc.theta_skip
   if skip then
     -- Replace the segment's DDIM updates with the learned cross-step shortcut.
     -- The backbone is NOT evaluated for this segment, so it costs no NFE: that is
     -- the whole point of the internalized shortcut.
     assign z = no_grad
     shortcut_apply(z, sys.u_all[seg_idx], sys.v_all[seg_idx], mc.rms_eps)
-    end
-    assign used_sc = used_sc + 1
-    assign t_cur = t_cur - seg_steps
-  else
-    -- z1 must be declared OUTSIDE the no_grad block: a `let` inside the block is
-    -- local to it, and referencing it after the block made the compiler treat the
-    -- unresolved binding as a non-builtin method target.
-    let z1 = no_grad
-      backbone_ode_step(sys.backbone, mc, z, t_cur, cond, sys.sched, bias)
-    end
-    assign z = z1
-    assign nfe = nfe + 1
-    if seg_steps > 1 then
-      let z2 = no_grad
-        backbone_ode_step(sys.backbone, mc, z1, t_cur - 1, cond, sys.sched, bias)
-      end
-      assign z = z2
-      assign nfe = nfe + 1
-    end
-    assign t_cur = t_cur - seg_steps
   end
-  assign seg = seg + 1
+  assign used_sc = used_sc + 1
+  assign t_cur = t_cur - seg_steps
+else
+  -- z1 must be declared OUTSIDE the no_grad block: a `let` inside the block is
+  -- local to it, and referencing it after the block made the compiler treat the
+  -- unresolved binding as a non-builtin method target.
+  let z1 = no_grad
+  backbone_ode_step(sys.backbone, mc, z, t_cur, cond, sys.sched, bias)
+end
+assign z = z1
+assign nfe = nfe + 1
+if seg_steps > 1 then
+  let z2 = no_grad
+  backbone_ode_step(sys.backbone, mc, z1, t_cur - 1, cond, sys.sched, bias)
+end
+assign z = z2
+assign nfe = nfe + 1
+end
+assign t_cur = t_cur - seg_steps
+end
+assign seg = seg + 1
 end
 
 -- The final DDIM step down to t = 0.
 let y_int = no_grad
-  backbone_ode_step(sys.backbone, mc, z, 1, cond, sys.sched, bias)
+backbone_ode_step(sys.backbone, mc, z, 1, cond, sys.sched, bias)
 end
 assign nfe = nfe + 1
 

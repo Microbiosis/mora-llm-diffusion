@@ -34,7 +34,7 @@ mora src/train_cad_bebc.mora
 - checkpoint：`checkpoints/cad_bebc_trained.safetensors`（21 个张量，含骨干、
   `W_blk`、短通路 `U/V`、跳步门与竞争门）
 - 指标：`checkpoints/cad_bebc_metrics.json`
-- 机制修复与实测记录：`docs/mechanism_fixes_2026-11-24.md`
+- 机制修复与实测记录：`docs/mechanism_fixes_2026-11-24.md`（第一/二轮）、`docs/mechanism_fixes_2026-11-25.md`（第三轮：训练/推理一致性）
 - 离散化：标准 VP 前向过程 + DDIM 采样器（`src/diffusion/schedule.mora`），
   观测以**独立投影加性注入**为条件（拼接无 autograd 支持，会使骨干梯度归零）
 - 训练分两阶段：① 骨干在**真实语料**上按 VP 过程预训练；② 误差门控巩固
@@ -65,13 +65,16 @@ mora src/train.mora
 │   ├── corpus.txt                  # 微型玩具语料
 │   └── tinystories_sample.txt      # TinyStories 样本（~2MB）
 ├── docs/
-│   └── cad_bebc_architecture.md    # CAD-BEBC 统一架构规范与边界说明
+│   ├── cad_bebc_architecture.md       # CAD-BEBC 统一架构规范与边界说明
+│   ├── mechanism_fixes_2026-11-24.md  # 第一/二轮机制修复与实测（含负面结果）
+│   └── mechanism_fixes_2026-11-25.md  # 第三轮：训练/推理一致性修复与起点扫描
 ├── models/
 │   ├── mini_llama_frozen.safetensors  # 冻结的 Mini-LLaMA 外部专家与潜空间编解码权重（25,056 参数）
 │   └── external_expert.safetensors    # 备用离线冻结 SwiGLU 外部专家权重（14,400 参数）
 ├── checkpoints/                    # 训练输出目录（按 .gitignore 忽略权重缓存）
 ├── scripts/
-│   └── prepare_hf.mora             # 生成 HF 模型卡
+│   ├── prepare_hf.mora                # 生成 HF 模型卡
+│   └── analyze_sampler.mora           # 采样器起点扫描：满路径/短路径/单发基线的 MSE 与 NFE
 ├── src/
 │   ├── cad_bebc.mora               # 【统一主入口】CAD-BEBC 全流程演化、文本/潜空间统一推理与 OOD 适应
 │   ├── latent_codec.mora           # 离散文本 <-> 连续潜空间块编解码器
@@ -118,6 +121,10 @@ mora fmt --check src tests
 
 # 3. 运行全量并发单元测试套件
 mora test
+
+# 3b. 训练真实语料并测量采样器起点/预算关系（满路径 vs 短通路 vs 单发基线）
+mora src/train_cad_bebc.mora
+mora scripts/analyze_sampler.mora
 
 # 4. 可选：启动独立外部 HTTP 模型服务（供 external_expert.mode="http" 对接）
 mora src/diffusion/external_service.mora
