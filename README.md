@@ -4,20 +4,19 @@
 
 ## 统一系统架构
 
-```text
-文本 / 连续输入
-  │
-  ▼
-LatentCodec（连续潜空间编码：src/latent_codec.mora）
-  │
-  ▼
-CAD-BEBC 统一调度与演化（src/cad_bebc.mora + src/diffusion/pipeline.mora）
-  ├─ 外部冻结专家快速通道 (pi_int < 0.05)  ──► 冻结 Mini-LLaMA / HTTP 服务（0 扩散步直出）
-  ├─ 内化短通路 (g_k >= theta_skip)     ──► 跨步低秩映射（跳过中间主干步，NFE 8 -> 2）
-  └─ 连续块扩散主干                       ──► 多步流匹配去噪（块内双向 + 块外 W_blk + 前缀因果）
-  │
-  ▼
-LatentCodec 解码输出 / 误差门控权重演进（m_low / m_fail + b_rest + 反传 W_blk）
+```mermaid
+flowchart TD
+  A[文本 / 连续输入] --> B[LatentCodec<br/>连续潜空间编码]
+  B --> C[CAD-BEBC 统一调度与演化<br/>cad_bebc.mora + pipeline.mora]
+  C --> D{竞争门 pi_int}
+  D -- "pi_int < 0.05" --> E[外部冻结专家快速通道<br/>Mini-LLaMA / HTTP<br/>0 扩散步]
+  D -- "内部路径" --> F{短通路门控 g_k}
+  F -- "g_k >= theta_skip" --> G[内化短通路<br/>跨步低秩映射<br/>NFE 8 → 2]
+  F -- "未达阈值" --> H[连续块扩散主干<br/>块内双向 + 块外 W_blk + 前缀因果]
+  E --> I[LatentCodec 解码输出]
+  G --> I
+  H --> I
+  I --> J[误差门控权重演进<br/>m_low / m_fail + b_rest]
 ```
 
 ## 目录结构
