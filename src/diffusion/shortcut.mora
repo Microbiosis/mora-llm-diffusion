@@ -21,10 +21,6 @@ export task deadzone_fail_gate(e_base: float, pc: PlasticityConfig): float
   return sigmoid_scalar((e_base - pc.eps_high) / pc.temp_e)
 end
 
-export task alignment_ok_gate(e_align: float, m_low: float, pc: PlasticityConfig): float
-  return m_low * sigmoid_scalar((pc.eps_shortcut - e_align) / pc.temp_s)
-end
-
 export task pool_mean_feature(z: Tensor<f64, _, cpu>, rms_eps: float): Tensor<f64, _, cpu>
   let normed = z.rms_norm(rms_eps)
   let shp = normed.shape()
@@ -43,12 +39,6 @@ end
 
 export task shortcut_apply(z: Tensor<f64, _, cpu>, u_seg: Tensor<f64, _, cpu>, v_seg: Tensor<f64, _, cpu>, rms_eps: float): Tensor<f64, _, cpu>
   return z + ((z.rms_norm(rms_eps) @ u_seg).silu() @ v_seg.transpose(0, 1))
-end
-
-export task shortcut_shadow_loss(u_seg: Tensor<f64, _, cpu>, v_seg: Tensor<f64, _, cpu>, z_entry: Tensor<f64, _, cpu>, z_target: Tensor<f64, _, cpu>, rms_eps: float): float
-  let pred = shortcut_apply(z_entry, u_seg, v_seg, rms_eps)
-  let d = pred - z_target
-  return (d * d).mean()
 end
 
 export task shortcut_gate_scalar(z: Tensor<f64, _, cpu>, wg_seg: Tensor<f64, _, cpu>, bg_seg: float, rms_eps: float): float
