@@ -19,6 +19,24 @@ flowchart TD
   I --> J[误差门控权重演进<br/>m_low / m_fail + b_rest]
 ```
 
+## 真实数据集训练（TinyStories）
+
+使用 TinyStories 样本（`data/tinystories_sample.txt`，~2MB）进行主干预训练：
+
+```bash
+# 修改 src/train.mora 中的配置路径为 config/train_tinystories.json，或直接运行
+mora src/train.mora
+```
+
+配置见 `config/train_tinystories.json`（d_model=128，4 层，seq_len=64，2000 步）。
+
+训练完成后可推到 Hugging Face：
+
+```bash
+python scripts/prepare_hf.py
+huggingface-cli upload Microbiosis/cad-bebc-tinystories hf_model .
+```
+
 ## 目录结构
 
 ```text
@@ -28,15 +46,19 @@ flowchart TD
 ├── config/
 │   ├── default.json                # 外部 Mini-LLaMA 预训练与分词器配置
 │   ├── diffusion.json              # CAD-BEBC 默认配置（2 层 D=32、prefix_blocks=2、mode=llama）
-│   └── diffusion.industrial.json   # CAD-BEBC 工业级目标配置（d=256、8 层、16 块）
+│   ├── diffusion.industrial.json   # CAD-BEBC 工业级目标配置（d=256、8 层、16 块）
+│   └── train_tinystories.json      # TinyStories 真实数据集训练配置
 ├── data/
-│   └── corpus.txt                  # 文本语料（用于 Mini-LLaMA 预训练与 CAD-BEBC 连续潜空间评估）
+│   ├── corpus.txt                  # 微型玩具语料
+│   └── tinystories_sample.txt      # TinyStories 样本（~2MB）
 ├── docs/
 │   └── cad_bebc_architecture.md    # CAD-BEBC 统一架构规范与边界说明
 ├── models/
 │   ├── mini_llama_frozen.safetensors  # 冻结的 Mini-LLaMA 外部专家与潜空间编解码权重（25,056 参数）
 │   └── external_expert.safetensors    # 备用离线冻结 SwiGLU 外部专家权重（14,400 参数）
 ├── checkpoints/                    # 训练输出目录（按 .gitignore 忽略权重缓存）
+├── scripts/
+│   └── prepare_hf.py               # 生成 HF 模型卡并提供上传命令
 ├── src/
 │   ├── cad_bebc.mora               # 【统一主入口】CAD-BEBC 全流程演化、文本/潜空间统一推理与 OOD 适应
 │   ├── latent_codec.mora           # 离散文本 <-> 连续潜空间块编解码器
