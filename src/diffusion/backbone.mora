@@ -1,9 +1,18 @@
 -- Multi-Layer Continuous Space Block-Diffusion Backbone & Structured/Corpus Latent Samplers.
 
 import "src/diffusion/config.mora"
+import "src/diffusion/schedule.mora"
 
 export struct BackboneParams
   in_proj: Tensor<f64, _, cpu>
+  -- The observation is injected as an explicit condition through its OWN
+  -- projection, added to the state projection:
+  --     h = (z_t @ in_proj) + (cond @ cond_proj) + pos_emb + t_cond
+  -- A separate projection is used instead of concatenating [z_t ; cond]
+  -- because Tensor::cat has no autograd support: measured inside value_and_grad,
+  -- the loss was correct (100.0) but the gradient through the concatenation was
+  -- exactly 0.0, which would silently freeze the whole backbone.
+  cond_proj: Tensor<f64, _, cpu>
   pos_emb: Tensor<f64, _, cpu>
   time_proj: Tensor<f64, _, cpu>
   attn_norm: Tensor<f64, _, cpu>
@@ -28,14 +37,15 @@ export task init_backbone_params(cfg: DiffModelConfig, seed: int = 20261123): Ba
   let sc = 0.1
   let res_sc = sc / math.sqrt(float(2 * l))
 
-  return BackboneParams(in_proj = Tensor::randn([d, d], "f64", "cpu") * sc, pos_emb = Tensor::randn([1, s, d], "f64", "cpu") * sc, time_proj = Tensor::randn([1, d], "f64", "cpu") * sc, attn_norm = Tensor::ones([l, d], "f64", "cpu"), wq = Tensor::randn([l, d, d], "f64", "cpu") * sc, wk = Tensor::randn([l, d, d], "f64", "cpu") * sc, wv = Tensor::randn([l, d, d], "f64", "cpu") * sc, wo = Tensor::randn([l, d, d], "f64", "cpu") * res_sc, ffn_norm = Tensor::ones([l, d], "f64", "cpu"), w_gate = Tensor::randn([l, d, h], "f64", "cpu") * sc, w_up = Tensor::randn([l, d, h], "f64", "cpu") * sc, w_down = Tensor::randn([l, h, d], "f64", "cpu") * res_sc, out_norm = Tensor::ones([d], "f64", "cpu"), out_proj = Tensor::randn([d, d], "f64", "cpu") * sc)
+  let in_w = d
+  return BackboneParams(in_proj = Tensor::randn([in_w, d], "f64", "cpu") * sc, cond_proj = Tensor::randn([in_w, d], "f64", "cpu") * sc, pos_emb = Tensor::randn([1, s, d], "f64", "cpu") * sc, time_proj = Tensor::randn([1, d], "f64", "cpu") * sc, attn_norm = Tensor::ones([l, d], "f64", "cpu"), wq = Tensor::randn([l, d, d], "f64", "cpu") * sc, wk = Tensor::randn([l, d, d], "f64", "cpu") * sc, wv = Tensor::randn([l, d, d], "f64", "cpu") * sc, wo = Tensor::randn([l, d, d], "f64", "cpu") * res_sc, ffn_norm = Tensor::ones([l, d], "f64", "cpu"), w_gate = Tensor::randn([l, d, h], "f64", "cpu") * sc, w_up = Tensor::randn([l, d, h], "f64", "cpu") * sc, w_down = Tensor::randn([l, h, d], "f64", "cpu") * res_sc, out_norm = Tensor::ones([d], "f64", "cpu"), out_proj = Tensor::randn([d, d], "f64", "cpu") * sc)
 end
 
 export task count_backbone_parameters(bp: BackboneParams): int
   return bp.in_proj.numel() + bp.pos_emb.numel() + bp.time_proj.numel() + bp.attn_norm.numel() + bp.wq.numel() + bp.wk.numel() + bp.wv.numel() + bp.wo.numel() + bp.ffn_norm.numel() + bp.w_gate.numel() + bp.w_up.numel() + bp.w_down.numel() + bp.out_norm.numel() + bp.out_proj.numel()
 end
 
-export task backbone_forward_raw(p_in: Tensor<f64, _, cpu>, p_pos: Tensor<f64, _, cpu>, p_time: Tensor<f64, _, cpu>, p_an: Tensor<f64, _, cpu>, p_wq: Tensor<f64, _, cpu>, p_wk: Tensor<f64, _, cpu>, p_wv: Tensor<f64, _, cpu>, p_wo: Tensor<f64, _, cpu>, p_fn: Tensor<f64, _, cpu>, p_wg: Tensor<f64, _, cpu>, p_wu: Tensor<f64, _, cpu>, p_wd: Tensor<f64, _, cpu>, p_on: Tensor<f64, _, cpu>, p_out: Tensor<f64, _, cpu>, z_t: Tensor<f64, _, cpu>, tau_t: Tensor<f64, _, cpu>, struct_bias: Tensor<f64, _, cpu>, n_layers: int, n_heads: int, head_dim: int, rms_eps: float): Tensor<f64, _, cpu>
+export task backbone_forward_raw(p_in: Tensor<f64, _, cpu>, p_pos: Tensor<f64, _, cpu>, p_time: Tensor<f64, _, cpu>, p_an: Tensor<f64, _, cpu>, p_wq: Tensor<f64, _, cpu>, p_wk: Tensor<f64, _, cpu>, p_wv: Tensor<f64, _, cpu>, p_wo: Tensor<f64, _, cpu>, p_fn: Tensor<f64, _, cpu>, p_wg: Tensor<f64, _, cpu>, p_wu: Tensor<f64, _, cpu>, p_wd: Tensor<f64, _, cpu>, p_on: Tensor<f64, _, cpu>, p_out: Tensor<f64, _, cpu>, z_t: Tensor<f64, _, cpu>, tau_t: Tensor<f64, _, cpu>, cond: Tensor<f64, _, cpu>, p_cond: Tensor<f64, _, cpu>, struct_bias: Tensor<f64, _, cpu>, n_layers: int, n_heads: int, head_dim: int, rms_eps: float): Tensor<f64, _, cpu>
   let shp = z_t.shape()
   let bsz = shp[0]
   let seq = shp[1]
@@ -43,7 +53,17 @@ export task backbone_forward_raw(p_in: Tensor<f64, _, cpu>, p_pos: Tensor<f64, _
   let scale = 1.0 / math.sqrt(float(head_dim))
 
   let t_cond = tau_t @ p_time
-  let h = (z_t @ p_in) + p_pos + t_cond.reshape([1, 1, d])
+  -- Conditional input: [z_t ; cond] concatenated along the feature axis, so the
+  -- input projection has width 2D. This is the ControlNet-style conditioning
+  -- that lets the observation drive the denoiser while the forward process
+  -- stays a standard VP process.
+  -- Additive condition injection (see BackboneParams.cond_proj): the condition
+  -- gets its own projection and is added to the state projection. Both paths
+  -- carry gradient, which a concatenation would not.
+  let h1 = z_t @ p_in
+  let h2 = cond @ p_cond
+  let h3 = h1 + h2
+  let h = h3 + p_pos + t_cond.reshape([1, 1, d])
 
   let l = 0
   while l < n_layers
@@ -52,7 +72,8 @@ export task backbone_forward_raw(p_in: Tensor<f64, _, cpu>, p_pos: Tensor<f64, _
     let k = (hn @ p_wk[l]).reshape([bsz, seq, n_heads, head_dim]).transpose(1, 2)
     let v = (hn @ p_wv[l]).reshape([bsz, seq, n_heads, head_dim]).transpose(1, 2)
 
-    let scores = (q @ k.transpose(-2, -1)) * scale + struct_bias
+    let sc_raw = q @ k.transpose(-2, -1)
+    let scores = sc_raw * scale + struct_bias
     let attn_w = scores.softmax()
     let ctx = (attn_w @ v).transpose(1, 2).reshape([bsz, seq, d])
     assign h = h + (ctx @ p_wo[l])
@@ -68,31 +89,46 @@ export task backbone_forward_raw(p_in: Tensor<f64, _, cpu>, p_pos: Tensor<f64, _
   return h_scaled @ p_out
 end
 
-export task backbone_predict_x0(bp: BackboneParams, cfg: DiffModelConfig, z_t: Tensor<f64, _, cpu>, tau_val: float, struct_bias: Tensor<f64, _, cpu>): Tensor<f64, _, cpu>
+export task backbone_predict_x0(bp: BackboneParams, cfg: DiffModelConfig, z_t: Tensor<f64, _, cpu>, tau_val: float, cond: Tensor<f64, _, cpu>, struct_bias: Tensor<f64, _, cpu>): Tensor<f64, _, cpu>
   let tau_t = tensor([[tau_val]], dtype = "f64", device = "cpu")
   return no_grad
-  backbone_forward_raw(bp.in_proj, bp.pos_emb, bp.time_proj, bp.attn_norm, bp.wq, bp.wk, bp.wv, bp.wo, bp.ffn_norm, bp.w_gate, bp.w_up, bp.w_down, bp.out_norm, bp.out_proj, z_t, tau_t, struct_bias, cfg.n_layers, cfg.n_heads, cfg.head_dim, cfg.rms_eps)
+  backbone_forward_raw(bp.in_proj, bp.pos_emb, bp.time_proj, bp.attn_norm, bp.wq, bp.wk, bp.wv, bp.wo, bp.ffn_norm, bp.w_gate, bp.w_up, bp.w_down, bp.out_norm, bp.out_proj, z_t, tau_t, cond, bp.cond_proj, struct_bias, cfg.n_layers, cfg.n_heads, cfg.head_dim, cfg.rms_eps)
 end
 end
 
-export task backbone_ode_step(bp: BackboneParams, cfg: DiffModelConfig, z_t: Tensor<f64, _, cpu>, step_t: int, struct_bias: Tensor<f64, _, cpu>): Tensor<f64, _, cpu>
-  let tau_val = float(step_t) / float(cfg.num_steps)
-  let x0_hat = backbone_predict_x0(bp, cfg, z_t, tau_val, struct_bias)
-  let inv_t = 1.0 / float(step_t)
-  return z_t + (x0_hat - z_t) * inv_t
+-- DDIM sampler step. step_t is the 1-based schedule index (step_t = 1 is the
+-- noisiest, cfg.num_steps the least noisy).
+--
+-- The previous implementation was
+--     z <- z + (x0_pred - z) / step_t
+-- which is NOT a DDIM update: it extrapolates along the x0 direction with a
+-- coefficient unrelated to the noise schedule, so the state leaves the training
+-- manifold and the x0 prediction degrades along the trajectory (measured:
+-- MSE 0.0935 at tau=1.0 rising to 0.2755 at tau=0.125, while the SAME model on
+-- the training distribution gives 0.1138 -> 0.0545, i.e. it improves there).
+--
+-- The DDIM update keeps z on the VP trajectory:
+--     eps_theta = (z_t - sqrt(ab_t) * x0_pred) / sqrt(1 - ab_t)
+--     z_{t-1}   = sqrt(ab_{t-1}) * x0_pred + sqrt(1 - ab_{t-1}) * eps_theta
+export task backbone_ode_step(bp: BackboneParams, cfg: DiffModelConfig, z_t: Tensor<f64, _, cpu>, step_t: int, cond: Tensor<f64, _, cpu>, sched: VpSchedule, struct_bias: Tensor<f64, _, cpu>): Tensor<f64, _, cpu>
+  let t_index = step_t - 1
+  let s_index = step_t - 2
+  let tau_val = vp_tau(sched, t_index)
+  let x0_hat = backbone_predict_x0(bp, cfg, z_t, tau_val, cond, struct_bias)
+  return ddim_step(sched, t_index, s_index, z_t, x0_hat, cfg.ddim_eta)
 end
 
-export task backbone_loss_fn(p_in: Tensor<f64, _, cpu>, p_pos: Tensor<f64, _, cpu>, p_time: Tensor<f64, _, cpu>, p_an: Tensor<f64, _, cpu>, p_wq: Tensor<f64, _, cpu>, p_wk: Tensor<f64, _, cpu>, p_wv: Tensor<f64, _, cpu>, p_wo: Tensor<f64, _, cpu>, p_fn: Tensor<f64, _, cpu>, p_wg: Tensor<f64, _, cpu>, p_wu: Tensor<f64, _, cpu>, p_wd: Tensor<f64, _, cpu>, p_on: Tensor<f64, _, cpu>, p_out: Tensor<f64, _, cpu>, z_t: Tensor<f64, _, cpu>, x_0: Tensor<f64, _, cpu>, tau_t: Tensor<f64, _, cpu>, struct_bias: Tensor<f64, _, cpu>, n_layers: int, n_heads: int, head_dim: int, rms_eps: float): float
-  let pred = backbone_forward_raw(p_in, p_pos, p_time, p_an, p_wq, p_wk, p_wv, p_wo, p_fn, p_wg, p_wu, p_wd, p_on, p_out, z_t, tau_t, struct_bias, n_layers, n_heads, head_dim, rms_eps)
+export task backbone_loss_fn(p_in: Tensor<f64, _, cpu>, p_pos: Tensor<f64, _, cpu>, p_time: Tensor<f64, _, cpu>, p_an: Tensor<f64, _, cpu>, p_wq: Tensor<f64, _, cpu>, p_wk: Tensor<f64, _, cpu>, p_wv: Tensor<f64, _, cpu>, p_wo: Tensor<f64, _, cpu>, p_fn: Tensor<f64, _, cpu>, p_wg: Tensor<f64, _, cpu>, p_wu: Tensor<f64, _, cpu>, p_wd: Tensor<f64, _, cpu>, p_on: Tensor<f64, _, cpu>, p_out: Tensor<f64, _, cpu>, p_cond: Tensor<f64, _, cpu>, z_t: Tensor<f64, _, cpu>, x_0: Tensor<f64, _, cpu>, tau_t: Tensor<f64, _, cpu>, cond: Tensor<f64, _, cpu>, struct_bias: Tensor<f64, _, cpu>, n_layers: int, n_heads: int, head_dim: int, rms_eps: float): float
+  let pred = backbone_forward_raw(p_in, p_pos, p_time, p_an, p_wq, p_wk, p_wv, p_wo, p_fn, p_wg, p_wu, p_wd, p_on, p_out, z_t, tau_t, cond, p_cond, struct_bias, n_layers, n_heads, head_dim, rms_eps)
   let diff = pred - x_0
   return (diff * diff).mean()
 end
 
-export task compute_consistency_error(bp: BackboneParams, cfg: DiffModelConfig, x_obs: Tensor<f64, _, cpu>, z_clean: Tensor<f64, _, cpu>, struct_bias: Tensor<f64, _, cpu>, seed: int, probe_sigma: float = 0.15, probe_t: float = 0.25): float
+export task compute_consistency_error(bp: BackboneParams, cfg: DiffModelConfig, x_obs: Tensor<f64, _, cpu>, z_clean: Tensor<f64, _, cpu>, cond: Tensor<f64, _, cpu>, struct_bias: Tensor<f64, _, cpu>, seed: int, probe_sigma: float = 0.15, probe_t: float = 0.25): float
   random.seed(seed)
   let eps = Tensor::randn(z_clean.shape(), "f64", "cpu") * probe_sigma
   let z_probe = z_clean + eps
-  let pred = backbone_predict_x0(bp, cfg, z_probe, probe_t, struct_bias)
+  let pred = backbone_predict_x0(bp, cfg, z_probe, probe_t, cond, struct_bias)
   let self_diff = pred - z_clean
   let obs_diff = z_clean - x_obs
   return float((self_diff * self_diff).mean() + 0.15 * (obs_diff * obs_diff).mean())
@@ -201,12 +237,16 @@ export task load_corpus_continuous_batch(corpus_path: string, batch_size: int, n
   return [Tensor::from_list(obs_rows, "f64"), Tensor::from_list(x0_rows, "f64")]
 end
 
-export task pretrain_backbone(bp: BackboneParams, cfg: DiffModelConfig, struct_bias: Tensor<f64, _, cpu>, steps: int, lr: float, seed: int): BackboneParams
+export task pretrain_backbone(bp: BackboneParams, cfg: DiffModelConfig, sched: VpSchedule, struct_bias: Tensor<f64, _, cpu>, steps: int, lr: float, seed: int): BackboneParams
   let cur = bp
-  let m_list: list<Tensor<f64, _, cpu>> = [Tensor::zeros(cur.in_proj.shape(), "f64", "cpu"), Tensor::zeros(cur.pos_emb.shape(), "f64", "cpu"), Tensor::zeros(cur.time_proj.shape(), "f64", "cpu"), Tensor::zeros(cur.attn_norm.shape(), "f64", "cpu"), Tensor::zeros(cur.wq.shape(), "f64", "cpu"), Tensor::zeros(cur.wk.shape(), "f64", "cpu"), Tensor::zeros(cur.wv.shape(), "f64", "cpu"), Tensor::zeros(cur.wo.shape(), "f64", "cpu"), Tensor::zeros(cur.ffn_norm.shape(), "f64", "cpu"), Tensor::zeros(cur.w_gate.shape(), "f64", "cpu"), Tensor::zeros(cur.w_up.shape(), "f64", "cpu"), Tensor::zeros(cur.w_down.shape(), "f64", "cpu"), Tensor::zeros(cur.out_norm.shape(), "f64", "cpu"), Tensor::zeros(cur.out_proj.shape(), "f64", "cpu")]
-  let v_list: list<Tensor<f64, _, cpu>> = [Tensor::zeros(cur.in_proj.shape(), "f64", "cpu"), Tensor::zeros(cur.pos_emb.shape(), "f64", "cpu"), Tensor::zeros(cur.time_proj.shape(), "f64", "cpu"), Tensor::zeros(cur.attn_norm.shape(), "f64", "cpu"), Tensor::zeros(cur.wq.shape(), "f64", "cpu"), Tensor::zeros(cur.wk.shape(), "f64", "cpu"), Tensor::zeros(cur.wv.shape(), "f64", "cpu"), Tensor::zeros(cur.wo.shape(), "f64", "cpu"), Tensor::zeros(cur.ffn_norm.shape(), "f64", "cpu"), Tensor::zeros(cur.w_gate.shape(), "f64", "cpu"), Tensor::zeros(cur.w_up.shape(), "f64", "cpu"), Tensor::zeros(cur.w_down.shape(), "f64", "cpu"), Tensor::zeros(cur.out_norm.shape(), "f64", "cpu"), Tensor::zeros(cur.out_proj.shape(), "f64", "cpu")]
+  -- The optimizer state lists follow the ARG-NUMS order of backbone_loss_fn, i.e.
+  -- exactly the order in which value_and_grad returns the gradients:
+  --   in_proj, pos_emb, time_proj, attn_norm, wq, wk, wv, wo, ffn_norm,
+  --   w_gate, w_up, w_down, out_norm, out_proj, cond_proj
+  let m_list: list<Tensor<f64, _, cpu>> = [Tensor::zeros(cur.in_proj.shape(), "f64", "cpu"), Tensor::zeros(cur.pos_emb.shape(), "f64", "cpu"), Tensor::zeros(cur.time_proj.shape(), "f64", "cpu"), Tensor::zeros(cur.attn_norm.shape(), "f64", "cpu"), Tensor::zeros(cur.wq.shape(), "f64", "cpu"), Tensor::zeros(cur.wk.shape(), "f64", "cpu"), Tensor::zeros(cur.wv.shape(), "f64", "cpu"), Tensor::zeros(cur.wo.shape(), "f64", "cpu"), Tensor::zeros(cur.ffn_norm.shape(), "f64", "cpu"), Tensor::zeros(cur.w_gate.shape(), "f64", "cpu"), Tensor::zeros(cur.w_up.shape(), "f64", "cpu"), Tensor::zeros(cur.w_down.shape(), "f64", "cpu"), Tensor::zeros(cur.out_norm.shape(), "f64", "cpu"), Tensor::zeros(cur.out_proj.shape(), "f64", "cpu"), Tensor::zeros(cur.cond_proj.shape(), "f64", "cpu")]
+  let v_list: list<Tensor<f64, _, cpu>> = [Tensor::zeros(cur.in_proj.shape(), "f64", "cpu"), Tensor::zeros(cur.pos_emb.shape(), "f64", "cpu"), Tensor::zeros(cur.time_proj.shape(), "f64", "cpu"), Tensor::zeros(cur.attn_norm.shape(), "f64", "cpu"), Tensor::zeros(cur.wq.shape(), "f64", "cpu"), Tensor::zeros(cur.wk.shape(), "f64", "cpu"), Tensor::zeros(cur.wv.shape(), "f64", "cpu"), Tensor::zeros(cur.wo.shape(), "f64", "cpu"), Tensor::zeros(cur.ffn_norm.shape(), "f64", "cpu"), Tensor::zeros(cur.w_gate.shape(), "f64", "cpu"), Tensor::zeros(cur.w_up.shape(), "f64", "cpu"), Tensor::zeros(cur.w_down.shape(), "f64", "cpu"), Tensor::zeros(cur.out_norm.shape(), "f64", "cpu"), Tensor::zeros(cur.out_proj.shape(), "f64", "cpu"), Tensor::zeros(cur.cond_proj.shape(), "f64", "cpu")]
 
-  let vg = value_and_grad(backbone_loss_fn, argnums = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
+  let vg = value_and_grad(backbone_loss_fn, argnums = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14])
   let beta1 = 0.9
   let beta2 = 0.999
   let eps = 0.00000001
@@ -215,18 +255,32 @@ export task pretrain_backbone(bp: BackboneParams, cfg: DiffModelConfig, struct_b
 
   let st = 1
   while st <= steps
-    let reg = if st % 2 == 0 then "simple" else "complex" end
-    let pair = sample_structured_batch(4, cfg.num_blocks, cfg.block_size, cfg.d_model, reg, seed + st * 17)
+    -- NOTE: this synthetic-data pretraining is the fallback path. The real
+    -- training entrypoint (src/train_cad_bebc.mora) pretrains the backbone on
+    -- REAL corpus windows instead, because the VP schedule and the condition
+    -- injection are calibrated to the real latent distribution.
+    let pair = sample_structured_batch(4, cfg.num_blocks, cfg.block_size, cfg.d_model, if st % 2 == 0 then "simple" else "complex" end, seed + st * 17)
     let x_obs = pair[0]
     let x_0 = pair[1]
     random.seed(seed + st * 31)
-    let step_idx = random.rand_int(0, cfg.num_steps + 1)
-    let tau_val = float(step_idx) / float(cfg.num_steps)
+    let step_idx = random.rand_int(0, cfg.num_steps)
+    let tau_val = vp_tau(sched, step_idx)
     let tau_t = tensor([[tau_val]], dtype = "f64", device = "cpu")
-    let noise = x_obs + Tensor::randn(x_0.shape(), "f64", "cpu") * 0.25
-    let z_t = x_0 * (1.0 - tau_val) + noise * tau_val
+    -- Standard VP forward process:
+    --     z_t = sqrt(ab_t) * x_0 + sqrt(1 - ab_t) * eps
+    -- The observation is supplied as an explicit CONDITION (concatenated with
+    -- z_t inside the input projection), NOT mixed into the noise term. Mixing it
+    -- in (the previous formula, z_t = (1-tau)*x_0 + tau*(x_obs + 0.25*eps)) is
+    -- what made the forward process non-standard and the sampler unsatisfiable.
+    -- NOTE: the noise tensor must NOT be called `eps`: the AdamW epsilon
+    -- (0.00000001) is declared with the same name in the enclosing scope, and
+    -- shadowing it made the optimizer term broadcast a [4,16,32] tensor into a
+    -- [32,32] parameter update.
+    let noise = Tensor::randn(x_0.shape(), "f64", "cpu")
+    let z_t = vp_forward(sched, step_idx, x_0, noise)
+    let cond = x_obs
 
-    let res = vg(cur.in_proj, cur.pos_emb, cur.time_proj, cur.attn_norm, cur.wq, cur.wk, cur.wv, cur.wo, cur.ffn_norm, cur.w_gate, cur.w_up, cur.w_down, cur.out_norm, cur.out_proj, z_t, x_0, tau_t, struct_bias, cfg.n_layers, cfg.n_heads, cfg.head_dim, cfg.rms_eps)
+    let res = vg(cur.in_proj, cur.pos_emb, cur.time_proj, cur.attn_norm, cur.wq, cur.wk, cur.wv, cur.wo, cur.ffn_norm, cur.w_gate, cur.w_up, cur.w_down, cur.out_norm, cur.out_proj, cur.cond_proj, z_t, x_0, tau_t, cond, struct_bias, cfg.n_layers, cfg.n_heads, cfg.head_dim, cfg.rms_eps)
     let gs: list<Tensor<f64, _, cpu>> = res[1]
 
     assign b1p = b1p * beta1
@@ -234,13 +288,13 @@ export task pretrain_backbone(bp: BackboneParams, cfg: DiffModelConfig, struct_b
     let bc1 = 1.0 - b1p
     let bc2 = 1.0 - b2p
 
-    let p_vec: list<Tensor<f64, _, cpu>> = [cur.in_proj, cur.pos_emb, cur.time_proj, cur.attn_norm, cur.wq, cur.wk, cur.wv, cur.wo, cur.ffn_norm, cur.w_gate, cur.w_up, cur.w_down, cur.out_norm, cur.out_proj]
+    let p_vec: list<Tensor<f64, _, cpu>> = [cur.in_proj, cur.pos_emb, cur.time_proj, cur.attn_norm, cur.wq, cur.wk, cur.wv, cur.wo, cur.ffn_norm, cur.w_gate, cur.w_up, cur.w_down, cur.out_norm, cur.out_proj, cur.cond_proj]
     let next_p: list<Tensor<f64, _, cpu>> = []
     let next_m: list<Tensor<f64, _, cpu>> = []
     let next_v: list<Tensor<f64, _, cpu>> = []
 
     let i = 0
-    while i < 14
+    while i < 15
       let m_new = m_list[i] * beta1 + gs[i] * (1.0 - beta1)
       let v_new = v_list[i] * beta2 + (gs[i] * gs[i]) * (1.0 - beta2)
       let p_new = p_vec[i] - ((m_new / bc1) / ((v_new / bc2).sqrt() + eps)) * lr
@@ -250,7 +304,7 @@ export task pretrain_backbone(bp: BackboneParams, cfg: DiffModelConfig, struct_b
       assign i = i + 1
     end
 
-    assign cur = BackboneParams(in_proj = next_p[0], pos_emb = next_p[1], time_proj = next_p[2], attn_norm = next_p[3], wq = next_p[4], wk = next_p[5], wv = next_p[6], wo = next_p[7], ffn_norm = next_p[8], w_gate = next_p[9], w_up = next_p[10], w_down = next_p[11], out_norm = next_p[12], out_proj = next_p[13])
+    assign cur = BackboneParams(in_proj = next_p[0], pos_emb = next_p[1], time_proj = next_p[2], attn_norm = next_p[3], wq = next_p[4], wk = next_p[5], wv = next_p[6], wo = next_p[7], ffn_norm = next_p[8], w_gate = next_p[9], w_up = next_p[10], w_down = next_p[11], out_norm = next_p[12], out_proj = next_p[13], cond_proj = next_p[14])
     assign m_list = next_m
     assign v_list = next_v
     assign st = st + 1

@@ -1,0 +1,114 @@
+-- Variance-preserving (VP) noise schedule and DDIM sampler for the CAD-BEBC
+-- continuous diffusion backbone.
+--
+-- Why this module exists
+-- ---------------------
+-- The backbone previously used a hand-rolled "forward process"
+--     z_t = (1 - tau) * x_0 + tau * (x_obs + 0.25 * eps)
+-- and a matching-but-non-standard update
+--     z <- z + (x0_pred - z) / step_t.
+-- Measurement showed why that pair cannot work:
+--
+--   * On the TRAINING distribution the x0 prediction improves monotonically with
+--     decreasing tau (tau=1.0 -> MSE 0.1138, tau=0.125 -> MSE 0.0545), i.e. the
+--     model IS a usable x0 predictor.
+--   * Along the sampled trajectory the same prediction degrades monotonically
+--     (tau=1.0 -> 0.0935, tau=0.125 -> 0.2755): the update pushes z off the
+--     training manifold, and the error compounds.
+--   * Substituting a textbook DDIM sampler with the same (wrongly trained)
+--     weights was worse than doing nothing (MSE 1.16 -> 0.56 against a 0.118
+--     observation baseline), which confirms the sampler cannot fix a backbone
+--     that was never trained on the matching forward process.
+--
+-- The fix has to be symmetric: train on a standard VP forward process and sample
+-- with the matching DDIM update. The observation is injected as an explicit
+-- CONDITION (concatenated into the input projection) rather than being mixed
+-- into the noise term, which is what made the old process non-standard in the
+-- first place.
+--
+-- VP forward process:
+--     z_t = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * eps,   eps ~ N(0, I)
+-- with alpha_bar_t = prod_{i<=t} (1 - beta_i), beta linear in [beta_start, beta_end].
+--
+-- DDIM (eta = 0) update from t to s, in x0-parameterisation:
+--     eps_theta = (z_t - sqrt(alpha_bar_t) * x0_pred) / sqrt(1 - alpha_bar_t)
+--     z_s       = sqrt(alpha_bar_s) * x0_pred
+--                 + sqrt(1 - alpha_bar_s - sigma_s^2) * eps_theta
+--                 + sigma_s * z_t
+
+export struct VpSchedule
+  betas: list<float>
+  alphas_bar: list<float>
+  num_steps: int = 8
+end
+
+-- Build a linear-beta VP schedule.
+export task make_vp_schedule(num_steps: int, beta_start: float, beta_end: float): VpSchedule
+  let betas: list<float> = []
+  let alphas_bar: list<float> = []
+  let acc = 1.0
+  let i = 0
+  while i < num_steps
+    let frac = if num_steps > 1 then float(i) / float(num_steps - 1) else 0.0 end
+    let beta = beta_start + (beta_end - beta_start) * frac
+    assign betas = betas.push(beta)
+    assign acc = acc * (1.0 - beta)
+    assign alphas_bar = alphas_bar.push(acc)
+    assign i = i + 1
+  end
+  return VpSchedule(betas = betas, alphas_bar = alphas_bar, num_steps = num_steps)
+end
+
+-- Normalised time in [0, 1] for a 0-based step index.
+export task vp_tau(sched: VpSchedule, step_index: int): float
+  if sched.num_steps <= 1 then
+    return 1.0
+  end
+  return float(step_index + 1) / float(sched.num_steps)
+end
+
+-- alpha_bar at a step index, clamped to the schedule.
+export task vp_alpha_bar(sched: VpSchedule, step_index: int): float
+  if step_index < 0 then
+    return 1.0
+  end
+  if step_index >= sched.alphas_bar.len() then
+    return sched.alphas_bar[sched.alphas_bar.len() - 1]
+  end
+  return sched.alphas_bar[step_index]
+end
+
+-- Sample z_t from the VP forward process given x_0 and a noise tensor.
+export task vp_forward(sched: VpSchedule, step_index: int, x_0: Tensor<f64, _, cpu>, eps: Tensor<f64, _, cpu>): Tensor<f64, _, cpu>
+  let ab = vp_alpha_bar(sched, step_index)
+  return x_0 * math.sqrt(ab) + eps * math.sqrt(1.0 - ab)
+end
+
+-- One DDIM step (eta = 0 by default) from step_index t to step_index s (s < t).
+export task ddim_step(sched: VpSchedule, t_index: int, s_index: int, z_t: Tensor<f64, _, cpu>, x0_pred: Tensor<f64, _, cpu>, eta: float): Tensor<f64, _, cpu>
+  let ab_t = vp_alpha_bar(sched, t_index)
+  let ab_s = vp_alpha_bar(sched, s_index)
+  -- eps_theta implied by the x0-parameterisation
+  let eps_theta = (z_t - x0_pred * math.sqrt(ab_t)) / math.sqrt(1.0 - ab_t)
+  -- DDIM stochastic term (0 for the deterministic eta = 0 sampler)
+  let sigma = 0.0
+  if eta > 0.0 and t_index > s_index then
+    let sig2 = eta * eta * (1.0 - ab_s) / (1.0 - ab_t) * (1.0 - ab_t / ab_s)
+    if sig2 < 0.0 then
+      assign sig2 = 0.0
+    end
+    assign sigma = math.sqrt(sig2)
+  end
+  -- clamp the radicand explicitly: math.max does not exist in Mora's math module.
+  let radicand = 1.0 - ab_s - sigma * sigma
+  let radicand_c = if radicand > 0.0 then radicand else 0.0 end
+  let dir_coef = math.sqrt(radicand_c)
+  let z_prev = x0_pred * math.sqrt(ab_s) + eps_theta * dir_coef + z_t * sigma
+  return z_prev
+end
+
+-- The initial DDIM state: the forward-noised x_0 at the last schedule step.
+export task ddim_init(sched: VpSchedule, x_0: Tensor<f64, _, cpu>, eps: Tensor<f64, _, cpu>): Tensor<f64, _, cpu>
+  let ab_t = vp_alpha_bar(sched, sched.num_steps - 1)
+  return x_0 * math.sqrt(ab_t) + eps * math.sqrt(1.0 - ab_t)
+end

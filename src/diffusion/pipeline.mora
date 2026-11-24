@@ -18,6 +18,7 @@ import "src/diffusion/expert.mora"
 
 export struct InternalizedDiffusionSystem
   cfg: DiffusionAppConfig
+  sched: VpSchedule
   backbone: BackboneParams
   w_blk: Tensor<f64, _, cpu>
   p_blk: Tensor<f64, _, cpu>
@@ -57,7 +58,10 @@ export struct InferResult
   g_int: float = 0.0
 end
 
-export task init_diffusion_system(cfg: DiffusionAppConfig): InternalizedDiffusionSystem
+-- pretrain_steps = 0 skips the backbone pretraining entirely, which is what the
+-- real-corpus training entrypoint uses: it pretrains the backbone on real corpus
+-- windows first and passes the result in via backbone_override.
+export task init_diffusion_system(cfg: DiffusionAppConfig, backbone_override: BackboneParams = BackboneParams(in_proj = Tensor::zeros([1, 1], "f64", "cpu"), cond_proj = Tensor::zeros([1, 1], "f64", "cpu"), pos_emb = Tensor::zeros([1, 1, 1], "f64", "cpu"), time_proj = Tensor::zeros([1, 1], "f64", "cpu"), attn_norm = Tensor::zeros([1, 1], "f64", "cpu"), wq = Tensor::zeros([1, 1, 1], "f64", "cpu"), wk = Tensor::zeros([1, 1, 1], "f64", "cpu"), wv = Tensor::zeros([1, 1, 1], "f64", "cpu"), wo = Tensor::zeros([1, 1, 1], "f64", "cpu"), ffn_norm = Tensor::zeros([1, 1], "f64", "cpu"), w_gate = Tensor::zeros([1, 1, 1], "f64", "cpu"), w_up = Tensor::zeros([1, 1, 1], "f64", "cpu"), w_down = Tensor::zeros([1, 1, 1], "f64", "cpu"), out_norm = Tensor::zeros([1], "f64", "cpu"), out_proj = Tensor::zeros([1, 1], "f64", "cpu"))): InternalizedDiffusionSystem
   let mc = cfg.model
   let sc = cfg.schedule
   random.seed(sc.seed)
@@ -68,8 +72,10 @@ export task init_diffusion_system(cfg: DiffusionAppConfig): InternalizedDiffusio
   let w_blk = init_w_blk(off_diag, mc.init_iso)
   let init_bias = struct_bias_from_wblk(w_blk, p_blk, off_diag, prefix_mask)
 
+  -- VP noise schedule shared by the backbone training and the DDIM sampler.
+  let sched = make_vp_schedule(mc.num_steps, mc.beta_start, mc.beta_end)
   let bp0 = init_backbone_params(mc, sc.seed)
-  let bp = pretrain_backbone(bp0, mc, init_bias, sc.pretrain_steps, sc.pretrain_lr, sc.seed)
+  let bp = if sc.pretrain_steps > 0 then pretrain_backbone(bp0, mc, sched, init_bias, sc.pretrain_steps, sc.pretrain_lr, sc.seed) else backbone_override end
 
   -- Cross-step low-rank shortcut (U, V).
   -- U/V form a bilinear product in shortcut_apply: z + silu(z @ U) @ V^T.
@@ -87,18 +93,24 @@ export task init_diffusion_system(cfg: DiffusionAppConfig): InternalizedDiffusio
 
   let exp = load_external_expert(cfg.external_expert, mc.rms_eps, "cpu")
 
-  return InternalizedDiffusionSystem(cfg = cfg, backbone = bp, w_blk = w_blk, p_blk = p_blk, off_diag = off_diag, prefix_mask = prefix_mask, u_all = u_all, v_all = v_all, wg_all = wg_all, bg_all = bg_all, w_comp = w_comp, b_comp = b_comp, expert = exp, total_steps = 0)
+  return InternalizedDiffusionSystem(cfg = cfg, sched = sched, backbone = bp, w_blk = w_blk, p_blk = p_blk, off_diag = off_diag, prefix_mask = prefix_mask, u_all = u_all, v_all = v_all, wg_all = wg_all, bg_all = bg_all, w_comp = w_comp, b_comp = b_comp, expert = exp, total_steps = 0)
 end
 
-task ode_step_tracked(bp: BackboneParams, z: Tensor<f64, _, cpu>, step_t: int, bias: Tensor<f64, _, cpu>, mc: DiffModelConfig): Tensor<f64, _, cpu>
-  let tau_t = Tensor::full([1, 1], float(step_t) / float(mc.num_steps), "f64", "cpu")
-  let x0h = backbone_forward_raw(bp.in_proj, bp.pos_emb, bp.time_proj, bp.attn_norm, bp.wq, bp.wk, bp.wv, bp.wo, bp.ffn_norm, bp.w_gate, bp.w_up, bp.w_down, bp.out_norm, bp.out_proj, z, tau_t, bias, mc.n_layers, mc.n_heads, mc.head_dim, mc.rms_eps)
-  return z + (x0h - z) * (1.0 / float(step_t))
+-- Differentiable DDIM step (the backbone forward stays on the autograd tape).
+task ode_step_tracked(bp: BackboneParams, z: Tensor<f64, _, cpu>, step_t: int, cond: Tensor<f64, _, cpu>, sched: VpSchedule, bias: Tensor<f64, _, cpu>, mc: DiffModelConfig): Tensor<f64, _, cpu>
+  let t_index = step_t - 1
+  let s_index = step_t - 2
+  let tau_t = Tensor::full([1, 1], vp_tau(sched, t_index), "f64", "cpu")
+  let x0h = backbone_forward_raw(bp.in_proj, bp.pos_emb, bp.time_proj, bp.attn_norm, bp.wq, bp.wk, bp.wv, bp.wo, bp.ffn_norm, bp.w_gate, bp.w_up, bp.w_down, bp.out_norm, bp.out_proj, z, tau_t, cond, bp.cond_proj, bias, mc.n_layers, mc.n_heads, mc.head_dim, mc.rms_eps)
+  return ddim_step(sched, t_index, s_index, z, x0h, mc.ddim_eta)
 end
 
-export task unified_diff_loss(p_wblk: Tensor<f64, _, cpu>, p_u: Tensor<f64, _, cpu>, p_v: Tensor<f64, _, cpu>, p_wg: Tensor<f64, _, cpu>, p_bg: Tensor<f64, _, cpu>, p_wcomp: Tensor<f64, _, cpu>, p_bcomp: Tensor<f64, _, cpu>, bp: BackboneParams, x_obs: Tensor<f64, _, cpu>, x_0: Tensor<f64, _, cpu>, y_ext: Tensor<f64, _, cpu>, seg_entries: list<Tensor<f64, _, cpu>>, seg_targets: list<Tensor<f64, _, cpu>>, z_pre_final: Tensor<f64, _, cpu>, p_blk: Tensor<f64, _, cpu>, off_diag: Tensor<f64, _, cpu>, prefix_mask: Tensor<f64, _, cpu>, mc: DiffModelConfig, pc: PlasticityConfig): Tensor<f64, _, cpu>
+export task unified_diff_loss(p_wblk: Tensor<f64, _, cpu>, p_u: Tensor<f64, _, cpu>, p_v: Tensor<f64, _, cpu>, p_wg: Tensor<f64, _, cpu>, p_bg: Tensor<f64, _, cpu>, p_wcomp: Tensor<f64, _, cpu>, p_bcomp: Tensor<f64, _, cpu>, bp: BackboneParams, x_obs: Tensor<f64, _, cpu>, x_0: Tensor<f64, _, cpu>, y_ext: Tensor<f64, _, cpu>, seg_entries: list<Tensor<f64, _, cpu>>, seg_targets: list<Tensor<f64, _, cpu>>, z_pre_final: Tensor<f64, _, cpu>, p_blk: Tensor<f64, _, cpu>, off_diag: Tensor<f64, _, cpu>, prefix_mask: Tensor<f64, _, cpu>, sched: VpSchedule, mc: DiffModelConfig, pc: PlasticityConfig): Tensor<f64, _, cpu>
   let bias = struct_bias_from_wblk(p_wblk, p_blk, off_diag, prefix_mask)
-  let y_int = ode_step_tracked(bp, z_pre_final, 1, bias, mc)
+  -- The condition tensor keeps the same shape as z_t; mc.cond_inject decides
+  -- whether the backbone concatenates it.
+  let cond = x_obs
+  let y_int = ode_step_tracked(bp, z_pre_final, 1, cond, sched, bias, mc)
   let pi_int = ((x_obs.rms_norm(mc.rms_eps) * p_wcomp).mean() + p_bcomp).sigmoid()
   let y_mix = y_int * pi_int + y_ext * (1.0 - pi_int)
   let d_mix = y_mix - x_0
@@ -142,7 +154,7 @@ export task unified_diff_loss(p_wblk: Tensor<f64, _, cpu>, p_u: Tensor<f64, _, c
   -- So the internal branch is additionally evaluated from x_obs, matching the
   -- inference semantics in infer_system.
   let y_int_obs = no_grad
-    backbone_ode_step(bp, mc, x_obs, mc.num_steps, bias)
+    backbone_ode_step(bp, mc, x_obs, mc.num_steps, cond, sched, bias)
   end
   let e_int = no_grad
     ((y_int_obs - x_0) * (y_int_obs - x_0)).mean()
@@ -282,24 +294,30 @@ export task emerge_step(sys: InternalizedDiffusionSystem, x_obs: Tensor<f64, _, 
   let mc = sys.cfg.model
   let pc = sys.cfg.plasticity
   let bias = struct_bias_from_wblk(sys.w_blk, sys.p_blk, sys.off_diag, sys.prefix_mask)
+  let cond = x_obs
 
   let y_ext = expert_predict(sys.expert, x_obs)
 
+  -- DDIM trajectory start: the forward-noised x_0 at the noisiest schedule step,
+  -- matching what the DDIM sampler visits during inference. The observation
+  -- enters only as the CONDITION, never as part of the state.
+  random.seed(seed + 11)
+  let eps_init = Tensor::randn(x_0.shape(), "f64", "cpu")
   let z = no_grad
-  backbone_ode_step(sys.backbone, mc, x_obs, mc.num_steps, bias)
+  ddim_init(sys.sched, x_0, eps_init)
 end
 
 let seg_entries: list<Tensor<f64, _, cpu>> = []
 let seg_targets: list<Tensor<f64, _, cpu>> = []
 let seg = 0
-let t_cur = mc.num_steps - 1
+let t_cur = mc.num_steps
 while seg < 3
   let z_entry = z
   let z1 = no_grad
-  backbone_ode_step(sys.backbone, mc, z, t_cur, bias)
+  backbone_ode_step(sys.backbone, mc, z, t_cur, cond, sys.sched, bias)
 end
 let z2 = no_grad
-backbone_ode_step(sys.backbone, mc, z1, t_cur - 1, bias)
+backbone_ode_step(sys.backbone, mc, z1, t_cur - 1, cond, sys.sched, bias)
 end
 assign seg_entries = seg_entries.push(z_entry)
 assign seg_targets = seg_targets.push(z2)
@@ -309,16 +327,16 @@ assign seg = seg + 1
 end
 let z_pre_final = z
 let y_int = no_grad
-backbone_ode_step(sys.backbone, mc, z_pre_final, 1, bias)
+backbone_ode_step(sys.backbone, mc, z_pre_final, 1, cond, sys.sched, bias)
 end
 
-let e_base = compute_consistency_error(sys.backbone, mc, x_obs, y_int, bias, seed + 19)
+let e_base = compute_consistency_error(sys.backbone, mc, x_obs, y_int, cond, bias, seed + 19)
 let m_low = deadzone_low_gate(e_base, pc)
 let m_fail = deadzone_fail_gate(e_base, pc)
 
 -- Fully differentiable update: single value_and_grad over all plasticity parameters
 let vg = value_and_grad(unified_diff_loss, argnums = [0, 1, 2, 3, 4, 5, 6])
-let res = vg(sys.w_blk, sys.u_all, sys.v_all, sys.wg_all, sys.bg_all, sys.w_comp, sys.b_comp, sys.backbone, x_obs, x_0, y_ext, seg_entries, seg_targets, z_pre_final, sys.p_blk, sys.off_diag, sys.prefix_mask, mc, pc)
+let res = vg(sys.w_blk, sys.u_all, sys.v_all, sys.wg_all, sys.bg_all, sys.w_comp, sys.b_comp, sys.backbone, x_obs, x_0, y_ext, seg_entries, seg_targets, z_pre_final, sys.p_blk, sys.off_diag, sys.prefix_mask, sys.sched, mc, pc)
 -- unified_diff_loss returns a 1-element tensor (required for Mora's autograd to
 -- seed the root gradient), so the reported loss is read out of the tensor.
 let int_loss = res[0].to_list()[0]
@@ -371,7 +389,7 @@ let b_comp_cur = sys.b_comp.to_list()[0]
 let b_comp_val = b_comp_cur - g_bcomp.to_list()[0] * (pc.eta_comp * step_ok) - pc.lambda_comp * step_fail * (b_comp_cur - mc.init_comp_bias)
 let b_comp_next = Tensor::full([1], b_comp_val, "f64", "cpu")
 
-let next_sys = InternalizedDiffusionSystem(cfg = sys.cfg, backbone = sys.backbone, w_blk = w_blk_next, p_blk = sys.p_blk, off_diag = sys.off_diag, prefix_mask = sys.prefix_mask, u_all = u_next, v_all = v_next, wg_all = wg_next, bg_all = bg_next, w_comp = w_comp_next, b_comp = b_comp_next, expert = sys.expert, total_steps = sys.total_steps + 1)
+let next_sys = InternalizedDiffusionSystem(cfg = sys.cfg, sched = sys.sched, backbone = sys.backbone, w_blk = w_blk_next, p_blk = sys.p_blk, off_diag = sys.off_diag, prefix_mask = sys.prefix_mask, u_all = u_next, v_all = v_next, wg_all = wg_next, bg_all = bg_next, w_comp = w_comp_next, b_comp = b_comp_next, expert = sys.expert, total_steps = sys.total_steps + 1)
 return EmergeStepResult(system = next_sys, int_loss = int_loss, e_base = e_base, m_ok_mean = step_ok, m_fail = step_fail)
 end
 
@@ -399,39 +417,92 @@ export task infer_system(sys: InternalizedDiffusionSystem, x_obs: Tensor<f64, _,
   end
 
   let bias = struct_bias_from_wblk(sys.w_blk, sys.p_blk, sys.off_diag, sys.prefix_mask)
+  let cond = x_obs
+
+  -- Conditional (img2img-style) DDIM start.
+  --
+  -- The task is "repair this observation", not "sample from pure noise", so the
+  -- sampler must START from the observation rather than from an unknown x_0.
+  -- The observation is projected onto the VP trajectory at schedule step
+  -- infer_start_step:
+  --     z_{t0} = sqrt(ab_{t0}) * x_obs + sqrt(1 - ab_{t0}) * eps
+  -- and the DDIM updates then run along the VP manifold down to t = 0. This keeps
+  -- the state ON the training manifold (the failure mode of the previous update
+  -- rule) while preserving the repair semantics.
+  let t_start = mc.infer_start_step
+  if t_start < 1 then
+    assign t_start = 1
+  end
+  if t_start > mc.num_steps then
+    assign t_start = mc.num_steps
+  end
+  random.seed(12345)
+  let eps_start = Tensor::randn(x_obs.shape(), "f64", "cpu")
   let z = no_grad
-  backbone_ode_step(sys.backbone, mc, x_obs, mc.num_steps, bias)
+  let ab_t0 = vp_alpha_bar(sys.sched, t_start - 1)
+  x_obs * math.sqrt(ab_t0) + eps_start * math.sqrt(1.0 - ab_t0)
 end
-let nfe = 1
+-- DDIM sampling loop.
+--
+-- The previous loop advanced a counter by 2 per segment and indexed the
+-- schedule with it (4,3 / 2,1 / 0,-1). Under the DDIM schedule that last pair
+-- indexes step -1, whose sqrt argument is negative, so the full path produced
+-- NaN. The loop is rewritten here to walk the schedule exactly once, from
+-- t_start down to 1, in single DDIM steps.
+--
+-- The cross-step shortcut is still consulted every SEGMENT_STRIDE schedule
+-- steps: when the matured gate fires, the DDIM update for that segment is
+-- REPLACED by the learned shortcut, which is what realises the "skip 2 backbone
+-- steps" claim. The skipped steps are still counted as NFE savings.
 let used_sc = 0
 let g_prod = 1.0
 let seg = 0
-let t_cur = mc.num_steps - 1
+let nfe = 0
+let t_cur = t_start
 
-while seg < 3
-  let gk = shortcut_gate_scalar(z, sys.wg_all[seg], float(sys.bg_all[seg]), mc.rms_eps)
+while t_cur >= 1
+  let seg_idx = seg % 3
+  -- NOTE: Tensor.item()/float() do not accept tensors; read the scalar bias via
+  -- to_list() (the gate bias tensor is 1-D, so to_list()[i] is the float).
+  let bg_seg = sys.bg_all.to_list()[seg_idx]
+  let gk = shortcut_gate_scalar(z, sys.wg_all[seg_idx], bg_seg, mc.rms_eps)
   assign g_prod = g_prod * gk
-  if !force_full and gk >= mc.theta_skip then
+  -- how many schedule steps this segment covers
+  let seg_steps = if t_cur >= 3 then 2 else 1 end
+  let skip = !force_full and gk >= mc.theta_skip
+  if skip then
+    -- Replace the segment's DDIM updates with the learned cross-step shortcut.
+    -- The backbone is NOT evaluated for this segment, so it costs no NFE: that is
+    -- the whole point of the internalized shortcut.
     assign z = no_grad
-    shortcut_apply(z, sys.u_all[seg], sys.v_all[seg], mc.rms_eps)
+    shortcut_apply(z, sys.u_all[seg_idx], sys.v_all[seg_idx], mc.rms_eps)
+    end
+    assign used_sc = used_sc + 1
+    assign t_cur = t_cur - seg_steps
+  else
+    -- z1 must be declared OUTSIDE the no_grad block: a `let` inside the block is
+    -- local to it, and referencing it after the block made the compiler treat the
+    -- unresolved binding as a non-builtin method target.
+    let z1 = no_grad
+      backbone_ode_step(sys.backbone, mc, z, t_cur, cond, sys.sched, bias)
+    end
+    assign z = z1
+    assign nfe = nfe + 1
+    if seg_steps > 1 then
+      let z2 = no_grad
+        backbone_ode_step(sys.backbone, mc, z1, t_cur - 1, cond, sys.sched, bias)
+      end
+      assign z = z2
+      assign nfe = nfe + 1
+    end
+    assign t_cur = t_cur - seg_steps
   end
-  assign used_sc = used_sc + 1
-  assign t_cur = t_cur - 2
-  let _done = 0
-else
-  assign z = no_grad
-  let z1 = backbone_ode_step(sys.backbone, mc, z, t_cur, bias)
-  backbone_ode_step(sys.backbone, mc, z1, t_cur - 1, bias)
-end
-assign nfe = nfe + 2
-assign t_cur = t_cur - 2
-let _done = 0
-end
-assign seg = seg + 1
+  assign seg = seg + 1
 end
 
+-- The final DDIM step down to t = 0.
 let y_int = no_grad
-backbone_ode_step(sys.backbone, mc, z, 1, bias)
+  backbone_ode_step(sys.backbone, mc, z, 1, cond, sys.sched, bias)
 end
 assign nfe = nfe + 1
 

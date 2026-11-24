@@ -12,6 +12,7 @@
 
 import "std/nn/safetensors"
 import "src/diffusion/config.mora"
+import "src/diffusion/schedule.mora"
 import "src/diffusion/causal_graph.mora"
 import "src/diffusion/backbone.mora"
 import "src/diffusion/shortcut.mora"
@@ -38,6 +39,7 @@ export task save_cad_bebc(path: string, sys: InternalizedDiffusionSystem, step: 
   let bp = sys.backbone
   let tensors: dict<string, any> = {}
   assign tensors = tensors.set("backbone.in_proj.weight", bp.in_proj)
+  assign tensors = tensors.set("backbone.cond_proj.weight", bp.cond_proj)
   assign tensors = tensors.set("backbone.pos_emb.weight", bp.pos_emb)
   assign tensors = tensors.set("backbone.time_proj.weight", bp.time_proj)
   assign tensors = tensors.set("backbone.attn_norm.weight", bp.attn_norm)
@@ -84,7 +86,7 @@ export task load_cad_bebc(path: string, cfg: DiffusionAppConfig, device: string 
   let ts = sf.tensors
   let mc = cfg.model
 
-  let bp = BackboneParams(in_proj = cad_req_tensor(ts, "backbone.in_proj.weight"), pos_emb = cad_req_tensor(ts, "backbone.pos_emb.weight"), time_proj = cad_req_tensor(ts, "backbone.time_proj.weight"), attn_norm = cad_req_tensor(ts, "backbone.attn_norm.weight"), wq = cad_req_tensor(ts, "backbone.wq.weight"), wk = cad_req_tensor(ts, "backbone.wk.weight"), wv = cad_req_tensor(ts, "backbone.wv.weight"), wo = cad_req_tensor(ts, "backbone.wo.weight"), ffn_norm = cad_req_tensor(ts, "backbone.ffn_norm.weight"), w_gate = cad_req_tensor(ts, "backbone.w_gate.weight"), w_up = cad_req_tensor(ts, "backbone.w_up.weight"), w_down = cad_req_tensor(ts, "backbone.w_down.weight"), out_norm = cad_req_tensor(ts, "backbone.out_norm.weight"), out_proj = cad_req_tensor(ts, "backbone.out_proj.weight"))
+  let bp = BackboneParams(in_proj = cad_req_tensor(ts, "backbone.in_proj.weight"), cond_proj = cad_req_tensor(ts, "backbone.cond_proj.weight"), pos_emb = cad_req_tensor(ts, "backbone.pos_emb.weight"), time_proj = cad_req_tensor(ts, "backbone.time_proj.weight"), attn_norm = cad_req_tensor(ts, "backbone.attn_norm.weight"), wq = cad_req_tensor(ts, "backbone.wq.weight"), wk = cad_req_tensor(ts, "backbone.wk.weight"), wv = cad_req_tensor(ts, "backbone.wv.weight"), wo = cad_req_tensor(ts, "backbone.wo.weight"), ffn_norm = cad_req_tensor(ts, "backbone.ffn_norm.weight"), w_gate = cad_req_tensor(ts, "backbone.w_gate.weight"), w_up = cad_req_tensor(ts, "backbone.w_up.weight"), w_down = cad_req_tensor(ts, "backbone.w_down.weight"), out_norm = cad_req_tensor(ts, "backbone.out_norm.weight"), out_proj = cad_req_tensor(ts, "backbone.out_proj.weight"))
 
   let p_blk = build_block_projection(mc.num_blocks, mc.block_size)
   let off_diag = build_off_diag_mask(mc.num_blocks)
@@ -94,7 +96,8 @@ export task load_cad_bebc(path: string, cfg: DiffusionAppConfig, device: string 
   let step_v = sf.metadata.get("step")
   let step_num = if step_v == nil then 0 else int(str(step_v)) end
 
-  return InternalizedDiffusionSystem(cfg = cfg, backbone = bp, w_blk = cad_req_tensor(ts, "plasticity.w_blk"), p_blk = p_blk, off_diag = off_diag, prefix_mask = prefix_mask, u_all = cad_req_tensor(ts, "plasticity.u_all"), v_all = cad_req_tensor(ts, "plasticity.v_all"), wg_all = cad_req_tensor(ts, "plasticity.wg_all"), bg_all = cad_req_tensor(ts, "plasticity.bg_all"), w_comp = cad_req_tensor(ts, "plasticity.w_comp"), b_comp = cad_req_tensor(ts, "plasticity.b_comp"), expert = exp, total_steps = step_num)
+  let sched = make_vp_schedule(mc.num_steps, mc.beta_start, mc.beta_end)
+  return InternalizedDiffusionSystem(cfg = cfg, sched = sched, backbone = bp, w_blk = cad_req_tensor(ts, "plasticity.w_blk"), p_blk = p_blk, off_diag = off_diag, prefix_mask = prefix_mask, u_all = cad_req_tensor(ts, "plasticity.u_all"), v_all = cad_req_tensor(ts, "plasticity.v_all"), wg_all = cad_req_tensor(ts, "plasticity.wg_all"), bg_all = cad_req_tensor(ts, "plasticity.bg_all"), w_comp = cad_req_tensor(ts, "plasticity.w_comp"), b_comp = cad_req_tensor(ts, "plasticity.b_comp"), expert = exp, total_steps = step_num)
 end
 
 export task inspect_cad_bebc(path: string): CadBebcCheckpointHeader

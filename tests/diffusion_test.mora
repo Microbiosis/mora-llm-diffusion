@@ -10,6 +10,7 @@ import "src/checkpoint.mora"
 import "src/sampler.mora"
 import "src/latent_codec.mora"
 import "src/diffusion/config.mora"
+import "src/diffusion/schedule.mora"
 import "src/diffusion/causal_graph.mora"
 import "src/diffusion/backbone.mora"
 import "src/diffusion/shortcut.mora"
@@ -49,8 +50,11 @@ export task test_cold_start_no_premature_skip_and_fast_path()
   assert_eq(inf_fast.backbone_nfe, 0)
   assert_eq(inf_fast.shortcuts_used, 0)
 
+  -- The DDIM sampler walks the schedule from infer_start_step down to 1 and then
+  -- performs one final step to t = 0, so the full-path NFE is
+  -- infer_start_step + 1 (it used to be the whole num_steps schedule).
   let inf_full = infer_system(sys, pair[0], true)
-  assert_eq(inf_full.backbone_nfe, 8)
+  assert_eq(inf_full.backbone_nfe, base.model.infer_start_step + 1)
   assert_eq(inf_full.shortcuts_used, 0)
 end
 
@@ -141,7 +145,8 @@ export task test_error_gated_emergence_skip_and_ood_fallback()
   -- internal path is forced.
   let inf = infer_system(sys, c_probe[0], false, true)
   assert(inf.shortcuts_used >= 1, "matured b_g must trigger early-skip execution")
-  assert(inf.backbone_nfe < 8, "shortened inference must strictly reduce backbone NFE")
+  let inf_full_ref = infer_system(sys, c_probe[0], true, true)
+  assert(inf.backbone_nfe < inf_full_ref.backbone_nfe, "shortened inference must strictly reduce backbone NFE")
 
   let b_before_ood = mean_gate_bias(sys)
   let v_before_ood = mean_shortcut_v_rms(sys)
@@ -157,5 +162,7 @@ export task test_error_gated_emergence_skip_and_ood_fallback()
   assert(mean_shortcut_v_rms(sys) < v_before_ood * 0.5, "m_fail must decay shortcut weights V under OOD")
   let inf_post = infer_system(sys, c_probe[0], true)
   assert_eq(inf_post.shortcuts_used, 0)
-  assert_eq(inf_post.backbone_nfe, 8)
+  -- Full-path NFE under the DDIM sampler is infer_start_step + 1 (the schedule is
+  -- walked from infer_start_step down to 1, then one final step to t = 0).
+  assert_eq(inf_post.backbone_nfe, base.model.infer_start_step + 1)
 end

@@ -27,6 +27,7 @@ import "src/checkpoint.mora"
 import "src/sampler.mora"
 import "src/latent_codec.mora"
 import "src/diffusion/config.mora"
+import "src/diffusion/schedule.mora"
 import "src/diffusion/causal_graph.mora"
 import "src/diffusion/backbone.mora"
 import "src/diffusion/shortcut.mora"
@@ -102,6 +103,63 @@ export task corpus_latent_batch(c: ByteCorpus, codec: LatentCodec, index: int, n
   return [Tensor::from_list(out_rows, "f64"), Tensor::from_list(clean_rows, "f64")]
 end
 
+-- Backbone pretraining on REAL corpus windows.
+--
+-- The backbone used to be pretrained on synthetic sinusoids
+-- (sample_structured_batch) while the system was evaluated on real text. With the
+-- standard VP forward process and the observation injected as a condition, that
+-- train/test mismatch mattered much more: the schedule and the condition path
+-- are calibrated to the real latent distribution.
+export task pretrain_backbone_real(bp: BackboneParams, cfg: DiffModelConfig, sched: VpSchedule, struct_bias: Tensor<f64, _, cpu>, corpus: ByteCorpus, codec: LatentCodec, steps: int, lr: float, seed: int): BackboneParams
+  let cur = bp
+  let m_list: list<Tensor<f64, _, cpu>> = [Tensor::zeros(cur.in_proj.shape(), "f64", "cpu"), Tensor::zeros(cur.pos_emb.shape(), "f64", "cpu"), Tensor::zeros(cur.time_proj.shape(), "f64", "cpu"), Tensor::zeros(cur.attn_norm.shape(), "f64", "cpu"), Tensor::zeros(cur.wq.shape(), "f64", "cpu"), Tensor::zeros(cur.wk.shape(), "f64", "cpu"), Tensor::zeros(cur.wv.shape(), "f64", "cpu"), Tensor::zeros(cur.wo.shape(), "f64", "cpu"), Tensor::zeros(cur.ffn_norm.shape(), "f64", "cpu"), Tensor::zeros(cur.w_gate.shape(), "f64", "cpu"), Tensor::zeros(cur.w_up.shape(), "f64", "cpu"), Tensor::zeros(cur.w_down.shape(), "f64", "cpu"), Tensor::zeros(cur.out_norm.shape(), "f64", "cpu"), Tensor::zeros(cur.out_proj.shape(), "f64", "cpu"), Tensor::zeros(cur.cond_proj.shape(), "f64", "cpu")]
+  let v_list: list<Tensor<f64, _, cpu>> = [Tensor::zeros(cur.in_proj.shape(), "f64", "cpu"), Tensor::zeros(cur.pos_emb.shape(), "f64", "cpu"), Tensor::zeros(cur.time_proj.shape(), "f64", "cpu"), Tensor::zeros(cur.attn_norm.shape(), "f64", "cpu"), Tensor::zeros(cur.wq.shape(), "f64", "cpu"), Tensor::zeros(cur.wk.shape(), "f64", "cpu"), Tensor::zeros(cur.wv.shape(), "f64", "cpu"), Tensor::zeros(cur.wo.shape(), "f64", "cpu"), Tensor::zeros(cur.ffn_norm.shape(), "f64", "cpu"), Tensor::zeros(cur.w_gate.shape(), "f64", "cpu"), Tensor::zeros(cur.w_up.shape(), "f64", "cpu"), Tensor::zeros(cur.w_down.shape(), "f64", "cpu"), Tensor::zeros(cur.out_norm.shape(), "f64", "cpu"), Tensor::zeros(cur.out_proj.shape(), "f64", "cpu"), Tensor::zeros(cur.cond_proj.shape(), "f64", "cpu")]
+  let vg = value_and_grad(backbone_loss_fn, argnums = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14])
+  let beta1 = 0.9
+  let beta2 = 0.999
+  let adam_eps = 0.00000001
+  let b1p = 1.0
+  let b2p = 1.0
+  let st = 1
+  while st <= steps
+    let pair = corpus_latent_batch(corpus, codec, st, cfg.num_blocks, cfg.block_size, true, seed + st * 17)
+    let x_obs = pair[0]
+    let x_0 = pair[1]
+    random.seed(seed + st * 31)
+    let step_idx = random.rand_int(0, cfg.num_steps)
+    let tau_val = vp_tau(sched, step_idx)
+    let tau_t = tensor([[tau_val]], dtype = "f64", device = "cpu")
+    -- Standard VP forward process with the observation as an explicit condition.
+    let noise = Tensor::randn(x_0.shape(), "f64", "cpu")
+    let z_t = vp_forward(sched, step_idx, x_0, noise)
+    let res = vg(cur.in_proj, cur.pos_emb, cur.time_proj, cur.attn_norm, cur.wq, cur.wk, cur.wv, cur.wo, cur.ffn_norm, cur.w_gate, cur.w_up, cur.w_down, cur.out_norm, cur.out_proj, cur.cond_proj, z_t, x_0, tau_t, x_obs, struct_bias, cfg.n_layers, cfg.n_heads, cfg.head_dim, cfg.rms_eps)
+    let gs: list<Tensor<f64, _, cpu>> = res[1]
+    assign b1p = b1p * beta1
+    assign b2p = b2p * beta2
+    let bc1 = 1.0 - b1p
+    let bc2 = 1.0 - b2p
+    let p_vec: list<Tensor<f64, _, cpu>> = [cur.in_proj, cur.pos_emb, cur.time_proj, cur.attn_norm, cur.wq, cur.wk, cur.wv, cur.wo, cur.ffn_norm, cur.w_gate, cur.w_up, cur.w_down, cur.out_norm, cur.out_proj, cur.cond_proj]
+    let next_p: list<Tensor<f64, _, cpu>> = []
+    let next_m: list<Tensor<f64, _, cpu>> = []
+    let next_v: list<Tensor<f64, _, cpu>> = []
+    let i = 0
+    while i < 15
+      let m_new = m_list[i] * beta1 + gs[i] * (1.0 - beta1)
+      let v_new = v_list[i] * beta2 + (gs[i] * gs[i]) * (1.0 - beta2)
+      let p_new = p_vec[i] - ((m_new / bc1) / ((v_new / bc2).sqrt() + adam_eps)) * lr
+      assign next_p = next_p.push(p_new)
+      assign next_m = next_m.push(m_new)
+      assign next_v = next_v.push(v_new)
+      assign i = i + 1
+    end
+    assign cur = BackboneParams(in_proj = next_p[0], pos_emb = next_p[1], time_proj = next_p[2], attn_norm = next_p[3], wq = next_p[4], wk = next_p[5], wv = next_p[6], wo = next_p[7], ffn_norm = next_p[8], w_gate = next_p[9], w_up = next_p[10], w_down = next_p[11], out_norm = next_p[12], out_proj = next_p[13], cond_proj = next_p[14])
+    assign m_list = next_m
+    assign v_list = next_v
+    assign st = st + 1
+  end
+  return cur
+end
+
 task evaluate(system: InternalizedDiffusionSystem, c: ByteCorpus, codec: LatentCodec, mc: DiffModelConfig, batches: int, seed: int, val_offset: int): float
   let total = 0.0
   let i = 0
@@ -113,6 +171,26 @@ task evaluate(system: InternalizedDiffusionSystem, c: ByteCorpus, codec: LatentC
     assign i = i + 1
   end
   return total / float(batches)
+end
+
+-- MSE of a K-step DDIM chain (K backbone evaluations) started from the
+-- observation projected onto the VP trajectory at schedule step K.
+export task ddim_chain_mse(sys: InternalizedDiffusionSystem, mc: DiffModelConfig, bias: Tensor<f64, _, cpu>, x_obs: Tensor<f64, _, cpu>, x_0: Tensor<f64, _, cpu>, k: int, seed: int): float
+  random.seed(seed)
+  let eps_s = Tensor::randn(x_0.shape(), "f64", "cpu")
+  let ab_t0 = vp_alpha_bar(sys.sched, k - 1)
+  let z = x_obs * math.sqrt(ab_t0) + eps_s * math.sqrt(1.0 - ab_t0)
+  let step = k
+  while step >= 1
+    let x0h = no_grad
+      backbone_predict_x0(sys.backbone, mc, z, vp_tau(sys.sched, step - 1), x_obs, bias)
+    end
+    assign z = no_grad
+      ddim_step(sys.sched, step - 1, step - 2, z, x0h, mc.ddim_eta)
+    end
+    assign step = step - 1
+  end
+  return float(((z - x_0) * (z - x_0)).mean())
 end
 
 task main()
@@ -128,7 +206,21 @@ task main()
   let corpus = load_byte_corpus("data/tinystories_sample.txt")
   print("corpus bytes:", corpus.n_bytes, "| latent dim:", codec.d_model, "| seq:", codec.seq_len)
 
-  let sys = init_diffusion_system(cfg)
+  -- Stage 1: pretrain the diffusion backbone on REAL corpus windows with the
+  -- standard VP forward process and the observation injected as a condition.
+  let sched = make_vp_schedule(mc.num_steps, mc.beta_start, mc.beta_end)
+  let p_blk = build_block_projection(mc.num_blocks, mc.block_size)
+  let off_diag = build_off_diag_mask(mc.num_blocks)
+  let prefix_mask = build_prefix_causal_mask(mc.num_blocks, mc.block_size, mc.prefix_blocks)
+  let w_blk_init = init_w_blk(off_diag, mc.init_iso)
+  let init_bias = struct_bias_from_wblk(w_blk_init, p_blk, off_diag, prefix_mask)
+  let bp0 = init_backbone_params(mc, sc.seed)
+  print("stage 1: pretraining backbone on real corpus (", sc.pretrain_steps, "steps )...")
+  let bp = pretrain_backbone_real(bp0, mc, sched, init_bias, corpus, codec, sc.pretrain_steps, sc.pretrain_lr, sc.seed)
+
+  -- Stage 2: build the CAD-BEBC system around the pretrained backbone.
+  let sys_cfg = DiffusionAppConfig(architecture = cfg.architecture, external_expert = cfg.external_expert, model = mc, plasticity = cfg.plasticity, schedule = ScheduleConfig(pretrain_steps = 0, pretrain_lr = sc.pretrain_lr, cold_start_steps = sc.cold_start_steps, consolidation_steps = sc.consolidation_steps, mature_eval_steps = sc.mature_eval_steps, ood_adapt_steps = sc.ood_adapt_steps, seed = sc.seed))
+  let sys = init_diffusion_system(sys_cfg, bp)
   print("backbone_params:", count_backbone_parameters(sys.backbone), "| frozen_external_expert:", count_expert_parameters(sys.expert))
 
   -- Training loop over REAL corpus windows.
@@ -148,6 +240,11 @@ task main()
   end
 
   -- Final evaluation: full path vs shortcut path on held-out real windows.
+  --
+  -- The shortcut path is only meaningful if it buys something, so the evaluation
+  -- also reports a MATCHED-COMPUTE baseline: a K-step DDIM chain that uses the
+  -- same number of backbone evaluations. The claim to check is "the shortcut
+  -- reaches the quality of a much longer chain for far fewer evaluations".
   let n = 12
   let m_full = 0.0
   let m_short = 0.0
@@ -173,6 +270,22 @@ task main()
   print("short-path MSE  :", m_short / dn, "| avg nfe:", float(nfes) / dn, "| avg skips:", float(skips) / dn)
   print("shortcut penalty:", (m_short - m_full) / m_full * 100.0, "%")
 
+  -- Matched-compute baseline: DDIM chains of increasing backbone-call budget.
+  print("=== Matched-compute baseline (DDIM with K backbone calls) ===")
+  let bias_eval = struct_bias_from_wblk(sys.w_blk, sys.p_blk, sys.off_diag, sys.prefix_mask)
+  let k = 1
+  while k <= mc.num_steps
+    let tot_k = 0.0
+    let j = 0
+    while j < n
+      let pr = corpus_latent_batch(corpus, codec, 900000 + j * 13, mc.num_blocks, mc.block_size, true, sc.seed + 4242 + j)
+      assign tot_k = tot_k + ddim_chain_mse(sys, mc, bias_eval, pr[0], pr[1], k, sc.seed + 4242 + j)
+      assign j = j + 1
+    end
+    print("  DDIM with", k, "backbone calls -> MSE:", tot_k / float(n))
+    assign k = k + 1
+  end
+
   -- Persist the trained system.
   let ckpt = "checkpoints/cad_bebc_trained.safetensors"
   let nb = save_cad_bebc(ckpt, sys, total_steps, last_loss, val_mse)
@@ -182,7 +295,7 @@ task main()
   print("tensors:", hdr.num_tensors, "| arch:", hdr.architecture, "| step:", hdr.step)
 
   let metrics: dict<string, any> = {}
-  assign metrics = metrics.set("architecture", cfg.architecture).set("total_steps", total_steps).set("final_train_loss", last_loss).set("val_mse", val_mse).set("short_mse", m_short / dn).set("avg_nfe", float(nfes) / dn).set("avg_skips", float(skips) / dn).set("v_rms", mean_shortcut_v_rms(sys)).set("gate_bias", mean_gate_bias(sys)).set("interblock_coupling", mean_interblock_coupling(sys.w_blk, mc.init_iso)).set("corpus_bytes", corpus.n_bytes).set("corpus_path", "data/tinystories_sample.txt").set("checkpoint", ckpt)
+  assign metrics = metrics.set("architecture", cfg.architecture).set("total_steps", total_steps).set("final_train_loss", last_loss).set("val_mse", val_mse).set("short_mse", m_short / dn).set("avg_nfe", float(nfes) / dn).set("avg_skips", float(skips) / dn).set("infer_start_step", mc.infer_start_step).set("sampler", "ddim").set("v_rms", mean_shortcut_v_rms(sys)).set("gate_bias", mean_gate_bias(sys)).set("interblock_coupling", mean_interblock_coupling(sys.w_blk, mc.init_iso)).set("corpus_bytes", corpus.n_bytes).set("corpus_path", "data/tinystories_sample.txt").set("checkpoint", ckpt)
   file.write_text("checkpoints/cad_bebc_metrics.json", json.stringify(metrics))
   print("metrics: checkpoints/cad_bebc_metrics.json")
 end

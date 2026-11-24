@@ -18,7 +18,7 @@
     "n_heads": 4,
     "head_dim": 8,
     "ffn_hidden": 64,
-    "rms_eps": 1e-5,
+    "rms_eps": 1e-05,
     "num_steps": 8,
     "shortcut_rank": 8,
     "init_iso": 2.0,
@@ -27,7 +27,12 @@
     "init_comp_bias": -4.0,
     "theta_skip": 0.62,
     "shortcut_u_init": 0.5,
-    "shortcut_v_init": 0.01
+    "shortcut_v_init": 0.01,
+    "beta_start": 0.05,
+    "beta_end": 0.5,
+    "cond_inject": true,
+    "ddim_eta": 0.0,
+    "infer_start_step": 8
   },
   "plasticity": {
     "eps_low": 0.08,
@@ -54,7 +59,7 @@
     "lambda_comp": 0.05
   },
   "schedule": {
-    "pretrain_steps": 140,
+    "pretrain_steps": 400,
     "pretrain_lr": 0.03,
     "cold_start_steps": 15,
     "consolidation_steps": 720,
