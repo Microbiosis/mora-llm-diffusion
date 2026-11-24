@@ -40,7 +40,7 @@ $$B_{\text{struct}} = P_{\text{blk}}\, (W_{\text{blk}} \odot M_{\text{off}})\, P
 
 $$m_{\text{low}} = \sigma\!\left(\frac{\epsilon_{\text{low}} - \mathcal{E}_{\text{base}}}{T_e}\right), \quad m_{\text{fail}} = \sigma\!\left(\frac{\mathcal{E}_{\text{base}} - \epsilon_{\text{high}}}{T_e}\right)$$
 
-当前主更新路径以 $m_{\text{low}}$ 作为正向步长缩放（`step_ok`），以 $m_{\text{fail}}$ 作为回退缩放。`alignment_ok_gate` 仍保留在 `shortcut.mora` 中，但主循环不再单独使用它。
+当前主更新路径以 $m_{\text{low}}$ 作为正向步长缩放（`step_ok`），以 $m_{\text{fail}}$ 作为回退缩放。
 
 ### 3.2 统一可微损失与不对称更新（慢生长 / 快回退）
 
