@@ -108,16 +108,22 @@ export task unified_diff_loss(p_wblk: Tensor<f64, _, cpu>, p_u: Tensor<f64, _, c
     let e_align = (d * d).mean()
     assign align = align + e_align
 
-    -- Differentiable gate supervision: encourage high gate when alignment is good
+    -- Stronger differentiable gate supervision:
+    -- When alignment is better than a relaxed threshold, push gate toward high value more aggressively.
     let z_bar = pool_mean_feature(seg_entries[k], mc.rms_eps)
     let logit = (z_bar * p_wg[k]).mean() + p_bg[k]
     let g = logit.sigmoid()
-    let target = (pc.eps_shortcut - e_align).sigmoid()
-    let ge = g - target
-    assign gate_sup = gate_sup + (ge * ge).mean()
+    let margin = pc.eps_shortcut * 1.8
+    let raw_t = (margin - e_align) / (pc.temp_s * 2.0)
+    let target = raw_t.sigmoid()
+    -- Extra positive bias when alignment is already decent
+    let bonus = if e_align < pc.eps_shortcut then 0.35 else 0.0 end
+    let soft_target = target * (1.0 - bonus) + bonus
+    let ge = g - soft_target
+    assign gate_sup = gate_sup + (ge * ge).mean() * 2.5
     assign k = k + 1
   end
-  return recon + 0.3 * align + 1.2 * gate_sup
+  return recon + 0.25 * align + gate_sup
 end
 
 task stack_3_2d(t0: Tensor<f64, _, cpu>, t1: Tensor<f64, _, cpu>, t2: Tensor<f64, _, cpu>): Tensor<f64, _, cpu>
