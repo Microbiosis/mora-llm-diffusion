@@ -1,0 +1,8 @@
+-- Prepare HF model card for CAD-BEBC.
+
+task main()
+  let readme = "---\nlanguage:\n- en\nlicense: mit\ntags:\n- diffusion\n- autoregressive\n- mora\n- cad-bebc\ndatasets:\n- roneneldan/TinyStories\n---\n\n# CAD-BEBC\n\nContinuous Autoregressive Diffusion with Block-External Bidirectional Causality.\n\nTrained on TinyStories sample.\n\nSee https://github.com/Microbiosis/mora-llm-diffusion\n"
+  file.write_text("hf_model/README.md", readme)
+  print("Wrote hf_model/README.md")
+  print("Upload: huggingface-cli upload Microbiosis/cad-bebc-tinystories hf_model .")
+end
