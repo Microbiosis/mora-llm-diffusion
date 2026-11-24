@@ -125,3 +125,12 @@ mora src/diffusion/external_service.mora
 # 5. 可选：重新训练外部 Mini-LLaMA 专家权重
 mora src/train.mora
 ```
+
+---
+
+## License
+
+Apache License 2.0 — 见 [LICENSE](LICENSE)。
+
+本项目依赖 [mora-lang](https://github.com/Microbiosis/mora-lang)（BSD-3-Clause）作为语言工具链与运行时，
+并在训练中使用 TinyStories（`roneneldan/TinyStories`）语料切片；具体见 LICENSE 末尾的第三方声明。
