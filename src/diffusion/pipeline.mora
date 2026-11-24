@@ -126,19 +126,6 @@ export task unified_diff_loss(p_wblk: Tensor<f64, _, cpu>, p_u: Tensor<f64, _, c
   return recon + 0.25 * align + gate_sup
 end
 
-task stack_3_2d(t0: Tensor<f64, _, cpu>, t1: Tensor<f64, _, cpu>, t2: Tensor<f64, _, cpu>): Tensor<f64, _, cpu>
-  let shp = t0.shape()
-  let s1: list<int> = [1]
-  for d in shp
-    assign s1 = s1.push(int(d))
-  end
-  return Tensor::cat([t0.reshape(s1), t1.reshape(s1), t2.reshape(s1)], 0)
-end
-
-task stack_3_1d(t0: Tensor<f64, _, cpu>, t1: Tensor<f64, _, cpu>, t2: Tensor<f64, _, cpu>): Tensor<f64, _, cpu>
-  return Tensor::cat([t0.reshape([1, t0.numel()]), t1.reshape([1, t1.numel()]), t2.reshape([1, t2.numel()])], 0)
-end
-
 task clamp_wblk(w: Tensor<f64, _, cpu>, off_diag: Tensor<f64, _, cpu>, init_iso: float): Tensor<f64, _, cpu>
   let rows: list<any> = w.to_list()
   let mask_rows: list<any> = off_diag.to_list()
