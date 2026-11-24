@@ -67,9 +67,17 @@ export task test_cad_bebc_attention_hierarchy()
 
   assert(math.abs(float(b0[0][1])) < 0.000000000001, "intra-block attention bias must be 0.0")
   assert(float(b0[0][2]) < -100000000.0, "prefix causal future block must be masked")
-  assert(math.abs(float(b0[2][0]) + 4.0) < 0.000000000001, "prefix backward attention must follow W_blk")
-  assert(math.abs(float(b0[4][6]) + 4.0) < 0.000000000001)
-  assert(math.abs(float(b0[6][4]) + 4.0) < 0.000000000001)
+  -- The inter-block bias must EQUAL W_blk (rather than a hard-coded number):
+  -- the initial bias now sits strictly inside the clamp interval so that the
+  -- error-gated backprop can grow the coupling, and the test states the
+  -- structural property instead of a constant that changes with the config.
+  let w_offdiag = w_blk.to_list()[0][1]
+  assert(math.abs(float(b0[2][0]) - w_offdiag) < 0.000000000001, "prefix backward attention must follow W_blk")
+  assert(math.abs(float(b0[4][6]) - w_offdiag) < 0.000000000001)
+  assert(math.abs(float(b0[6][4]) - w_offdiag) < 0.000000000001)
+  -- and the initial bias must be strictly inside the clamp interval, otherwise
+  -- the coupling could never grow.
+  assert(w_offdiag > -4.0, "initial W_blk must leave room for the coupling to grow")
 end
 
 export task test_live_http_external_expert_roundtrip()

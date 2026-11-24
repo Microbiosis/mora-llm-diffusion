@@ -56,8 +56,20 @@ export task build_prefix_causal_mask(num_blocks: int, block_size: int, prefix_bl
   return Tensor::from_list(rows, "f64")
 end
 
+-- Initial inter-block causal bias.
+--
+-- The previous initialisation put W_blk exactly ON the clamp boundary
+-- (-init_iso), while clamp_wblk keeps W_blk inside [-init_iso, 0]. Any gradient
+-- that would have INCREASED the coupling (i.e. moved W_blk towards 0) was
+-- therefore clipped away and the inter-block coupling could not grow at all:
+-- measured growth over 720 steps was 0.206%, and the coupling metric
+-- mean(exp(W_blk)) never moved.
+--
+-- The initial bias is now placed strictly inside the allowed interval, leaving
+-- room for the error-gated backprop to grow the coupling towards 0 (stronger
+-- coupling) or pull it back towards -init_iso (stronger isolation).
 export task init_w_blk(off_diag: Tensor<f64, _, cpu>, init_iso: float): Tensor<f64, _, cpu>
-  return off_diag * (-init_iso)
+  return off_diag * (-init_iso * 0.5)
 end
 
 export task struct_bias_from_wblk(w_blk: Tensor<f64, _, cpu>, p_blk: Tensor<f64, _, cpu>, off_diag: Tensor<f64, _, cpu>, prefix_mask: Tensor<f64, _, cpu>): Tensor<f64, _, cpu>
