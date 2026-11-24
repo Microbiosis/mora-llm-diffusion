@@ -21,20 +21,31 @@ flowchart TD
 
 ## 真实数据集训练（TinyStories）
 
-使用 TinyStories 样本（`data/tinystories_sample.txt`，~2MB）进行主干预训练：
+### 训练 CAD-BEBC 架构本体（主训练入口）
+
+```bash
+mora src/train_cad_bebc.mora
+```
+
+在真实语料（`data/tinystories_sample.txt`，2 MB TinyStories）上训练 CAD-BEBC 架构本体：
+潜空间取 Mini-LLaMA token embedding，做 720 步误差门控巩固，在留出窗口上评估，
+并写出可重载的 checkpoint 与指标文件。
+
+- checkpoint：`checkpoints/cad_bebc_trained.safetensors`（21 个张量，含骨干、
+  `W_blk`、短通路 `U/V`、跳步门与竞争门）
+- 指标：`checkpoints/cad_bebc_metrics.json`
+- 机制修复与实测记录：`docs/mechanism_fixes_2026-11-24.md`
+
+已发布产物：<https://huggingface.co/redmingwei/cad-bebc-tinystories>
+
+### 训练外部 Mini-LLaMA 专家（冻结教师）
 
 ```bash
 mora src/train.mora
 ```
 
-配置见 `config/train_tinystories.json`（d_model=128，4 层，seq_len=64，2000 步）。需把 `src/train.mora` 里的配置路径改为 `config/train_tinystories.json`。
-
-训练完成后可推到 Hugging Face：
-
-```bash
-mora scripts/prepare_hf.mora
-huggingface-cli upload Microbiosis/cad-bebc-tinystories hf_model .
-```
+配置见 `config/train_tinystories.json`。该脚本训练的是外部冻结专家，
+**不是**被研究的架构本体。
 
 ## 目录结构
 
